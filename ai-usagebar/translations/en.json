@@ -1,5 +1,9 @@
 {
   "settings": {
+    "account": {
+      "description": "Optional named account label from ai-usagebar. Leave empty for the default account. Ignored when the provider is Automatic.",
+      "label": "Account label"
+    },
     "color_by_usage": {
       "description": "Tints the reading as the quota gets tight. Off keeps the capsule in the bar's own colour.",
       "label": "Color by usage"
@@ -60,6 +64,7 @@
         "anthropic_api": "Anthropic API",
         "antigravity": "Antigravity",
         "auto": "Automatic (primary)",
+        "commandcode": "Command Code",
         "cursor": "Cursor",
         "deepseek": "DeepSeek",
         "grok": "Grok",
@@ -68,8 +73,10 @@
         "kiro": "Kiro",
         "minimax": "MiniMax",
         "moonshot": "Moonshot",
+        "nous": "Nous Research",
         "novita": "Novita",
         "openai": "Codex",
+        "opencode_go": "OpenCode Go",
         "openrouter": "OpenRouter",
         "supergrok": "SuperGrok",
         "zai": "Z.AI"
@@ -102,10 +109,13 @@
     "hidden_label": "Not shown",
     "hidden_value": "{count} more, click to open the panel",
     "install": "Install page",
+    "last_reading": "Last reading, {minutes} min ago",
+    "last_reading_now": "Last reading, moments ago",
     "loading": "Loading…",
     "no_usage": "No usage reported",
     "not_configured": "`{vendor}` is not configured in ai-usagebar",
     "now": "now",
+    "plan_changed": "The plan changed; readings taken under the previous one were dropped.",
     "refresh": "Refresh now",
     "refresh_queued": "Refresh queued",
     "refreshing": "Refreshing usage",

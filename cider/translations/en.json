@@ -28,6 +28,10 @@
         "osd": "OSD panel"
       }
     },
+    "glyph": {
+      "description": "Icon shown on the bar chip when artwork is hidden or missing.",
+      "label": "Fallback glyph"
+    },
     "lyrics_karaoke_active": {
       "description": "Hex for the word currently being sung when Custom. Empty keeps Noctalia primary. Example: #83c2c8",
       "label": "Active word color"
@@ -86,6 +90,26 @@
     "lyrics_osd_show_next": {
       "description": "Dim preview of the upcoming lyric under the current line.",
       "label": "Show next line"
+    },
+    "lyrics_plain_scroll": {
+      "description": "Advance plain lyrics over the song length instead of freezing on the first line. Drift vs vocals is expected.",
+      "label": "Scroll untimed lyrics"
+    },
+    "lyrics_plain_scroll_silence": {
+      "description": "Hold scroll during quiet system audio (intros/gaps). Soft beds may pause too. Needs parec.",
+      "label": "Pause when quiet"
+    },
+    "lyrics_plain_scroll_silence_level": {
+      "description": "How loud audio must be before scroll advances (1–40).",
+      "label": "Quiet threshold"
+    },
+    "lyrics_plain_scroll_speed": {
+      "description": "Pace relative to song length (25–300%). 100 is default.",
+      "label": "Scroll speed"
+    },
+    "lyrics_show_untimed": {
+      "description": "Off by default. Show plain lyrics that have no timestamps. Synced karaoke always shows.",
+      "label": "Show untimed lyrics"
     },
     "osd_duration_ms": {
       "description": "How long the notification or now-playing OSD stays visible after a track change.",
