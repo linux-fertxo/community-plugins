@@ -1,5 +1,82 @@
 # Changelog
 
+## [0.4.4] - 2026-11-04
+
+### Added
+- **Helium sign-in**: Helium Browser (`helium`) is listed on the sign-in page and authenticated through the same DevTools route as the other Chromium browsers. AppImage installs need `helium` on `PATH`. When the debug window is closed before extraction, the fallback reads Helium's own profile from `~/.config/net.imput.helium` (or the `.dev` variant).
+
+## [0.4.3] - 2026-11-03
+
+### Fixed
+- **Browser detection**: browsers packaged under their own binary name (Brave Origin's `brave-origin`, Zen's `zen-browser`) and Flatpak installs that only expose an app id on `PATH` are now listed on the sign-in page instead of showing up greyed out.
+- **Zen sign-in**: the Zen profile is looked up in `~/.config/zen`, `~/.zen` and the Flatpak profile directory, and the profile `[Install*] Default=` points at is preferred over a leftover `Default=1` profile that holds no cookies.
+- **Cookie file safety**: picking Zen when no Zen profile is found reports the missing profile instead of running `yt-dlp` with an invalid browser spec and truncating a `cookies.txt` that still works.
+
+## [0.4.0] - 2026-10-08
+
+### Added
+- **Playlist filter**: filter the open playlist by title or artist. Matches paginate, and "Play all" queues exactly what is on screen.
+- **Playlist prefetch**: the whole playlist loads on open, so paging and filtering are instant caching for 30 mins
+- **Fuzzy filters**: the Queue, Offline and Library pages now have fuzzy filtering
+- **Offline Cached tab**: Cached tracks now listed in 'Offline' page
+- **Settings tabs**: the Settings page has same tabbed-view as other pages
+- **Track row menu**: hover a row for quick actions, or right-click the actions button for the full context menu.
+
+### Changed
+- **Native I/O and argv refactor**: filesystem work, JSON filtering and network calls now go through Noctalia's native APIs and `argv` invocations instead of spawning shell helpers.
+- **Requires Noctalia API 28** (was 26).
+- Track rows carry one combined download/cache indicator, and the old play-next button is gone.
+
+### Fixed
+- Minor UI fixes
+
+## [0.3.3] - 2026-09-28
+
+### Added
+- **Queue reordering**: drag a track by its grip to move it; the playing track keeps playing and follows its own place. A manual order also supersedes the pre-shuffle snapshot.
+
+## [0.3.2] - 2026-10-02
+
+### Added
+ - **Media widget transport**: Next/Previous now work in Noctalia's core media widget (and `playerctl`) while a track plays, advancing the same queue as the miniplayer and full panel.
+ 
+## [0.3.1] - 2026-09-28
+
+### Fixed
+- **Player bar artist fallback**: the subtitle line now shows `Unknown artist` when a track is loaded without artist metadata instead of `Pick something to play`.
+
+## [0.3.0] - 2026-09-25
+
+### Added
+- **Shell corner radius scale**: every panel and mini-player surface now follows the shell's `shell.corner_radius_scale` setting via `theme.radius` (default 12 * scale), re-read each time a panel opens.
+
+## [0.2.8] - 2026-09-24
+
+### Fixed
+- **Tracks starting paused**: mpv is now launched with `--pause=no` so songs starts playing immediately instead of being stuck in a paused state.
+
+## [0.2.7] - 2026-09-21
+
+### Added
+- Music artwork in the Noctalia media widget via MPRIS (`mpv-mpris` `cover-art-files`).
+
+## [0.2.6] - 2026-09-12
+
+### Fixed
+- **CPU budget watchdog**: Decoupled state watch callback handling in `service.luau` using asynchronous dispatch, preventing Noctalia's watchdog from killing the service with `state watch callback exceeded its CPU budget`.
+- **UTF-8 string corruption**: Replaced byte-class patterns (`[^•]`) with byte-safe plain string search in delimiter parsing (`helpers.luau`), resolving invalid UTF-8 byte crashes (`0x96`) on Asian characters, Japanese typography, and unicode delimiters.
+- **Playlist track count fallback**: Added fallback calculation for albums and playlists lacking explicit total track count to prevent the UI from remaining stuck on `Loading tracks... 0 total`.
+- **Atomic offline library audit**: Prevented playlists from temporarily vanishing or showing 0 tracks during startup/rescan by making downloaded playlist state transitions atomic.
+- **Login state detection race**: Added fallback disk verification for `cookies.txt` in UI state initialization, preventing temporary unauthenticated banner flashes during startup.
+- **Download metadata disk writes**: Batched offline metadata saves during bulk playlist queueing instead of writing disk state per item.
+- **Scratch file collisions**: Increased scratch file rotation pool from 8 to 128 slots to prevent concurrent request data overwrites.
+- **Offline library protection**: Prevented library refresh from executing when offline or wiping cached playlists on failed fetches.
+
+### Added
+- **Manual library refresh**: Added refresh buttons with animated loading spinner states to both the sidebar header and the Library view to trigger instantaneous resync of user playlists and library state.
+- **Stream resolution resilience**: Updated yt-dlp resolver to request `bestaudio/best` with `mweb,web` client fallbacks, bypassing YouTube throttling without unnecessary audio re-encoding.
+- **In-memory thumbnail caching**: Avoids redundant disk stat calls for already resolved thumbnail paths.
+
 ## [0.2.5] - 2026-09-04
 
 ### Fixed

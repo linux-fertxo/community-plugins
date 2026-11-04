@@ -30,14 +30,63 @@ local PROVIDER_GLYPHS = {
     commandcode = "terminal-2",
     copilot = "brand-github-copilot",
     gemini = "brand-google",
+    deepinfra = "cloud",
+    grokbot = "brand-x",
+    ollama = "cloud",
+    orcarouter = "route",
+    modelstudio = "cloud",
+    lyceum = "book",
+    devin = "terminal-2",
+    cline = "terminal-2",
+    ["muse-code"] = "code",
+    synthetic = "flask",
+}
+
+local PROVIDER_DASHBOARDS = {
+    anthropic = "https://claude.ai/settings/usage",
+    anthropic_api = "https://console.anthropic.com/",
+    openai = "https://chatgpt.com/codex/settings/usage",
+    openrouter = "https://openrouter.ai/activity",
+    cursor = "https://www.cursor.com/settings",
+    deepseek = "https://platform.deepseek.com/",
+    zai = "https://z.ai",
+    kimi = "https://platform.moonshot.cn/",
+    moonshot = "https://platform.moonshot.cn/",
+    grok = "https://console.x.ai/",
+    supergrok = "https://grok.com/",
+    gemini = "https://aistudio.google.com/",
+    copilot = "https://github.com/settings/copilot",
+    minimax = "https://platform.minimaxi.com/",
+    antigravity = "https://antigravity.google/",
+    kilo = "https://app.kilo.ai/usage",
+    novita = "https://novita.ai/console",
+    kiro = "https://app.kiro.dev/",
+    nous = "https://portal.nousresearch.com/",
+    ["opencode-go"] = "https://opencode.ai/console/",
+    commandcode = "https://commandcode.ai/signin",
+    deepinfra = "https://deepinfra.com/",
+    grokbot = "https://x.ai/bot",
+    ollama = "https://ollama.com/settings",
+    orcarouter = "https://www.orcarouter.ai/",
+    modelstudio = "https://modelstudio.console.alibabacloud.com/",
+    lyceum = "https://dashboard.lyceum.technology/",
+    devin = "https://app.devin.ai/",
+    cline = "https://app.cline.bot/",
+    ["muse-code"] = "https://dev.meta.ai/",
+    synthetic = "https://synthetic.new/",
 }
 
 function M.baseProvider(id)
     return (tostring(id or ""):match("^[^@]+") or "")
 end
 
-function M.providerGlyph(id)
-    return PROVIDER_GLYPHS[M.baseProvider(id)] or "brain"
+function M.providerGlyph(id, brand)
+    local mark = type(brand) == "string" and PROVIDER_GLYPHS[brand] or nil
+    return mark or PROVIDER_GLYPHS[M.baseProvider(id)] or "brain"
+end
+
+function M.providerDashboard(id)
+    return PROVIDER_DASHBOARDS[M.baseProvider(id)]
 end
 
 -- Ask the poller for a read. `at` is never read: it is there so two requests in
@@ -51,6 +100,36 @@ end
 -- the capsule cannot disagree about which lines are data.
 function M.saysError(value)
     return tostring(value or ""):lower():find("error:") ~= nil
+end
+
+function M.transportError(value)
+    return tostring(value or ""):lower():match("http%s*:?%s*%d%d%d") ~= nil
+end
+
+local function terminalAuthText(value)
+    local text = tostring(value or ""):lower()
+    local status = text:match("http%s*:?%s*401") ~= nil
+        or text:match("http%s*:?%s*403") ~= nil
+    local rejected = text:find("reject", 1, true) ~= nil
+        or text:find("invalid", 1, true) ~= nil
+        or text:find("expired", 1, true) ~= nil
+        or text:find("forbidden", 1, true) ~= nil
+        or text:find("unauthorized", 1, true) ~= nil
+    return status and text:find("auth", 1, true) ~= nil and rejected
+end
+
+function M.terminalAuth(entry)
+    if type(entry) ~= "table" then return false end
+    if terminalAuthText(entry.error) then return true end
+    local sections = type(entry.sections) == "table" and entry.sections or {}
+    for _, section in ipairs(sections) do
+        if type(section) == "table" and section.type == "text"
+            and terminalAuthText(tostring(section.label or "") .. " "
+                .. tostring(section.value or "")) then
+            return true
+        end
+    end
+    return false
 end
 
 -- A provider the CLI is no longer reading: the entry either fails outright, or
@@ -73,7 +152,23 @@ function M.warning(entry)
 end
 
 function M.unavailable(entry)
-    return M.warning(entry) ~= ""
+    if type(entry) ~= "table" then return true end
+    if entry.status == "error" or M.warning(entry) ~= "" then return true end
+    if entry.stale ~= true then return false end
+    local sections = type(entry.sections) == "table" and entry.sections or {}
+    for _, section in ipairs(sections) do
+        if type(section) == "table" and section.type == "text"
+            and (M.transportError(section.label) or M.transportError(section.value)) then
+            return true
+        end
+    end
+    return false
+end
+
+-- A parser failure says nothing about the account's availability.
+function M.readFailure(entry)
+    return type(entry) == "table" and entry.status == "error"
+        and tostring(entry.error or ""):find("^schema mismatch:") ~= nil
 end
 
 -- Anything else in the `error` slot means no failure.
@@ -88,8 +183,9 @@ function M.asFailure(value)
 end
 
 -- "2026-08-15T11:29:59.872624Z" -> unix seconds. The stamps are UTC and
--- os.time() reads its table as local, so the offset is measured at that same
--- instant and added back.
+-- os.time() reads its table as local, so the offset is measured and added back.
+-- Force standard time on both conversions: DST must not normalize the UTC
+-- fields through a nonexistent or ambiguous local wall time.
 function M.parseIso(value)
     if type(value) ~= "string" then return nil end
     local y, mo, d, h, mi, s = value:match("^(%d+)%-(%d+)%-(%d+)T(%d+):(%d+):(%d+)")
@@ -97,12 +193,10 @@ function M.parseIso(value)
     local asLocal = os.time({
         year = tonumber(y), month = tonumber(mo), day = tonumber(d),
         hour = tonumber(h), min = tonumber(mi), sec = tonumber(s),
+        isdst = false,
     })
     local utc = os.date("!*t", asLocal)
-    -- Let os.time resolve DST for these wall-clock fields. os.date marks a UTC
-    -- table as standard time, which is wrong when the same fields fall in the
-    -- local timezone's daylight-saving season.
-    utc.isdst = nil
+    utc.isdst = false
     local utcAsLocal = os.time(utc)
     return asLocal + (asLocal - utcAsLocal)
 end
@@ -118,10 +212,26 @@ local function formatDuration(seconds)
     return string.format("%dm", rest)
 end
 
+local function formatFixedDuration(seconds)
+    if seconds <= 0 then return noctalia.tr("ui.now") end
+    local minutes = math.floor(seconds / 60)
+    local days = math.floor(minutes / 1440)
+    local hours = math.floor((minutes % 1440) / 60)
+    local rest = minutes % 60
+    if days > 0 then return string.format("%dd %dh", days, hours) end
+    return string.format("%dh %02dm", hours, rest)
+end
+
 function M.countdown(section)
     local at = M.parseIso(section and section.reset_at)
     if at == nil then return "" end
     return formatDuration(at - os.time())
+end
+
+function M.fixedCountdown(section)
+    local at = M.parseIso(section and section.reset_at)
+    if at == nil then return "" end
+    return formatFixedDuration(at - os.time())
 end
 
 -- Where the countdown lands: "14:20" today, "Sat 14:20" past midnight, a date
@@ -139,7 +249,7 @@ end
 
 -- How much of the window is gone, out of "Resets in 1h 58m · 60% elapsed".
 function M.elapsedPercent(detail)
-    local value = tostring(detail or ""):match("(%d+)%%%s*elapsed")
+    local value = tostring(detail or ""):match("([%+%-]?[%d%.]+)%%%s*elapsed")
     return value ~= nil and tonumber(value) or nil
 end
 
@@ -158,9 +268,302 @@ function M.pace(detail)
     return last, points, word
 end
 
+-- Kept next to the role both entries colour with, so the tiers cannot be edited
+-- in one file and forgotten in the other. `low` falls through to 0, like
+-- anything the CLI adds later.
+M.SEVERITY_RANK = { critical = 3, high = 2, mid = 1 }
+
+local function isCritical(metric)
+    if type(metric) ~= "table" then return false end
+    local sev = tostring(metric.severity or "")
+    local pct = tonumber(metric.percent) or 0
+    return sev == "critical" or pct >= 100
+end
+M.isCritical = isCritical
+
+-- Severity is a warning, not proof of exhaustion. Only a full quota blocks use.
+function M.blockingMetric(metrics)
+    local blocking = nil
+    for _, metric in ipairs(metrics or {}) do
+        if type(metric) == "table" and (tonumber(metric.percent) or 0) >= 100 then
+            local reset = M.parseIso(metric.reset_at) or -1
+            local previous = M.parseIso(blocking and blocking.reset_at) or -1
+            if blocking == nil or reset > previous then blocking = metric end
+        end
+    end
+    return blocking
+end
+
+-- A model pool limits that model alone. Provider summaries use shared windows
+-- when present; a pool-only report still has useful quota to display.
+local function sharedMetrics(metrics)
+    local shared, pools = {}, {}
+    for _, metric in ipairs(metrics or {}) do
+        if type(metric) == "table" then
+            local target = metric.model_pool == true and pools or shared
+            target[#target + 1] = metric
+        end
+    end
+    return #shared > 0 and shared or pools
+end
+
+function M.headline(entry)
+    if type(entry) ~= "table" or type(entry.metrics) ~= "table" then return nil end
+    local metrics = sharedMetrics(entry.metrics)
+    if #metrics == 0 then return nil end
+
+    local blocking = M.blockingMetric(metrics)
+    if blocking ~= nil then return blocking end
+
+    -- 1. For Antigravity: always follow active session usage across models
+    if M.baseProvider(entry.id) == "antigravity" then
+        local seen = {}
+        local best = nil
+        local bestPct = -1
+        for _, metric in ipairs(metrics) do
+            if type(metric) == "table" and metric.label ~= nil and metric.label ~= "" then
+                local model = tostring(metric.label)
+                if not seen[model] then
+                    seen[model] = true
+                    local pct = tonumber(metric.percent) or 0
+                    if pct > bestPct then
+                        best = metric
+                        bestPct = pct
+                    end
+                end
+            end
+        end
+        if best ~= nil then return best end
+    end
+
+    -- Otherwise keep the primary window selected by the CLI.
+    for _, metric in ipairs(metrics) do
+        if type(metric) == "table" then return metric end
+    end
+    return nil
+end
+
+-- A provider can report a balance instead of a quota. The CLI then sends no
+-- percentage metrics and puts the figure in a `text` section (DeepSeek
+-- `Balance: $2.90`, Nous `Total usable credits: 8.19`). Pick the one a reader
+-- would want on the bar: a total or balance first, then a credit/remaining
+-- line, and never a reset countdown. Returns nil for providers that already
+-- carry a headline metric, so the percentage path is untouched.
+function M.balanceText(entry)
+    if type(entry) ~= "table" or M.headline(entry) ~= nil then return nil end
+    local sections = type(entry.sections) == "table" and entry.sections or nil
+    if sections == nil then return nil end
+
+    local credit = nil
+    for _, section in ipairs(sections) do
+        if type(section) == "table" and section.type == "text" then
+            local value = noctalia.string.trim(tostring(section.value or ""))
+            if value ~= "" and not M.saysError(value) then
+                local label = tostring(section.label or ""):lower()
+                if label:find("total", 1, true) or label:find("balance", 1, true) then
+                    return value
+                end
+                if credit == nil
+                    and (label:find("credit", 1, true) or label:find("remaining", 1, true)) then
+                    credit = value
+                end
+            end
+        end
+    end
+    return credit
+end
+
+-- Explicit pins require a real matching window; positional fallback would turn
+-- a missing monthly quota into a plausible but unrelated weekly reading.
+function M.metricWindow(metric)
+    if type(metric) ~= "table" then return nil end
+    local seconds = tonumber(metric.window_secs)
+    if seconds ~= nil then
+        if seconds > 0 and seconds <= 86400 then return "session" end
+        if seconds == 604800 then return "weekly" end
+        if seconds >= 2419200 and seconds <= 2678400 then return "monthly" end
+        return nil
+    end
+    local label = tostring(metric.label or ""):lower()
+    if label:find("month", 1, true) or label:find("30d", 1, true) then return "monthly" end
+    if label:find("week", 1, true) or label:find("7d", 1, true) then return "weekly" end
+    if label:find("session", 1, true) or label:find("hour", 1, true)
+        or label:match("%d+h") then return "session" end
+    return nil
+end
+
+function M.windowMetric(metrics, window)
+    if type(metrics) ~= "table" then return nil end
+    for _, metric in ipairs(metrics) do
+        if M.metricWindow(metric) == window then return metric end
+    end
+    return nil
+end
+
+function M.displayPercent(metric, display)
+    if type(metric) ~= "table" then return nil end
+    local percent = tonumber(metric.percent)
+    if percent == nil or percent ~= percent or percent == math.huge or percent == -math.huge then return nil end
+    if display == "remaining" then return math.max(0, 100 - percent) end
+    return percent
+end
+
+-- The report names the headline field: balances are already formatted and
+-- must not be inverted when the user chooses remaining percentages.
+function M.metricText(metric, display)
+    if type(metric) ~= "table" then return "—" end
+    if metric.headline == "value" then
+        local value = type(metric.value) == "string" and noctalia.string.trim(metric.value) or ""
+        return value ~= "" and value or "—"
+    end
+    local percent = M.displayPercent(metric, display)
+    return percent ~= nil and string.format("%d%%", percent) or "—"
+end
+
+function M.capsuleMetric(entry, window)
+    if type(entry) ~= "table" or type(entry.metrics) ~= "table" then return nil end
+    if window == nil or window == "auto" then return M.headline(entry) end
+    local metrics = sharedMetrics(entry.metrics)
+    return M.blockingMetric(metrics) or M.windowMetric(metrics, window)
+end
+
+function M.modelGlyph(label)
+    local lower = tostring(label or ""):lower()
+    if lower:find("oss", 1, true) or lower:find("claude", 1, true) then return "robot" end
+    if lower:find("gemini", 1, true) then return "brand-google" end
+    if lower:find("gpt", 1, true) or lower:find("openai", 1, true) then return "brand-openai" end
+    return "sparkles"
+end
+
+function M.modelDisplayName(label)
+    local lower = tostring(label or ""):lower()
+    if lower:find("oss", 1, true) or lower:find("claude", 1, true) then return tostring(label or "") end
+    if lower:find("gemini", 1, true) then return tostring(label or "") end
+    if lower:find("gpt", 1, true) or lower:find("openai", 1, true) then return "GPT" end
+    return tostring(label or "")
+end
+
+function M.modelHeadlines(entry)
+    if type(entry) ~= "table" or type(entry.metrics) ~= "table" then return {} end
+    if M.baseProvider(entry.id) ~= "antigravity" then return {} end
+
+    local order = {}
+    local byModel = {}
+    for _, metric in ipairs(entry.metrics) do
+        if type(metric) == "table" and metric.label ~= nil and metric.label ~= "" then
+            local model = tostring(metric.label)
+            if byModel[model] == nil then
+                byModel[model] = {}
+                order[#order + 1] = model
+            end
+            byModel[model][#byModel[model] + 1] = metric
+        end
+    end
+
+    local result = {}
+    for _, model in ipairs(order) do
+        local modelMetrics = byModel[model]
+        local sessionMetric, weeklyMetric = M.dualMetrics(modelMetrics)
+        sessionMetric = sessionMetric or weeklyMetric
+        local blockingMetric = M.blockingMetric(modelMetrics)
+        if sessionMetric ~= nil then
+            result[#result + 1] = {
+                model = model,
+                displayName = M.modelDisplayName(model),
+                glyph = M.modelGlyph(model),
+                metric = sessionMetric,
+                metrics = modelMetrics,
+                blockingMetric = blockingMetric,
+            }
+        end
+    end
+    return result
+end
+
+-- Extracts (shortMetric, weeklyMetric) where shortMetric represents the 5-hour
+-- session limit and weeklyMetric represents the 7-day rate limit.
+function M.dualMetrics(metrics)
+    if type(metrics) ~= "table" then return nil, nil end
+    metrics = sharedMetrics(metrics)
+    if #metrics == 0 then return nil, nil end
+    if #metrics == 1 then
+        local m = metrics[1]
+        local isWeekly = false
+        if type(m) == "table" then
+            local w = tonumber(m.window_secs)
+            local lbl = tostring(m.label or ""):lower()
+            if (w ~= nil and w > 86400) or lbl:find("week", 1, true) or lbl:find("7d", 1, true) then
+                isWeekly = true
+            end
+        end
+        if isWeekly then
+            return nil, m
+        end
+        return m, nil
+    end
+
+    local shortMetric = nil
+    local weeklyMetric = nil
+
+    for _, m in ipairs(metrics) do
+        if type(m) == "table" then
+            local w = tonumber(m.window_secs)
+            local lbl = tostring(m.label or ""):lower()
+            if w ~= nil then
+                if w <= 86400 and shortMetric == nil then
+                    shortMetric = m
+                elseif w > 86400 and weeklyMetric == nil then
+                    weeklyMetric = m
+                end
+            elseif lbl:find("5h", 1, true) or lbl:find("session", 1, true) or lbl:find("hour", 1, true) then
+                if shortMetric == nil then shortMetric = m end
+            elseif lbl:find("week", 1, true) or lbl:find("7d", 1, true) then
+                if weeklyMetric == nil then weeklyMetric = m end
+            end
+        end
+    end
+
+    if shortMetric ~= nil and weeklyMetric ~= nil then
+        return shortMetric, weeklyMetric
+    end
+
+    if shortMetric ~= nil and weeklyMetric == nil and #metrics >= 2 then
+        for _, m in ipairs(metrics) do
+            if m ~= shortMetric then return shortMetric, m end
+        end
+    end
+
+    if weeklyMetric ~= nil and shortMetric == nil and #metrics >= 2 then
+        for _, m in ipairs(metrics) do
+            if m ~= weeklyMetric then return m, weeklyMetric end
+        end
+    end
+
+    return metrics[1], metrics[2]
+end
+
 function M.entries(report)
     if type(report) ~= "table" or type(report.entries) ~= "table" then return {} end
-    return report.entries
+    local visible, positions = {}, {}
+    for _, entry in ipairs(report.entries) do
+        if type(entry) == "table" and not M.terminalAuth(entry)
+            and (not M.unavailable(entry) or M.readFailure(entry)) then
+            visible[#visible + 1] = entry
+            positions[entry] = #visible
+        end
+    end
+    table.sort(visible, function(a, b)
+        local aMetric = M.headline(a)
+        local bMetric = M.headline(b)
+        local aRank = M.SEVERITY_RANK[tostring(aMetric and aMetric.severity or "")] or 0
+        local bRank = M.SEVERITY_RANK[tostring(bMetric and bMetric.severity or "")] or 0
+        if aRank ~= bRank then return aRank > bRank end
+        local aPercent = type(aMetric) == "table" and tonumber(aMetric.percent) or -1
+        local bPercent = type(bMetric) == "table" and tonumber(bMetric.percent) or -1
+        if aPercent ~= bPercent then return aPercent > bPercent end
+        return positions[a] < positions[b]
+    end)
+    return visible
 end
 
 -- A provider can report more than it was given, so clamp before this becomes a
@@ -171,17 +574,6 @@ function M.ratio(percent)
     if value > 1 then return 1 end
     return value
 end
-
-function M.headline(entry)
-    if type(entry) ~= "table" or type(entry.metrics) ~= "table" then return nil end
-    local first = entry.metrics[1]
-    return type(first) == "table" and first or nil
-end
-
--- Kept next to the role both entries colour with, so the tiers cannot be edited
--- in one file and forgotten in the other. `low` falls through to 0, like
--- anything the CLI adds later.
-M.SEVERITY_RANK = { critical = 3, high = 2, mid = 1 }
 
 -- The CLI tiers every percentage; copying its thresholds here would be a second
 -- source of truth. `calm` is for when it raised nothing.

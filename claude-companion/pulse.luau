@@ -20,66 +20,18 @@
 -- widgets: `secondary` for the ambient/working states (idle, tool), `primary`
 -- for the Claude-active states (thinking/responding/done), `error` for the
 -- attention bell + hard errors. Brightness math needs real RGB, so the roles
--- are resolved from the active palette JSON on disk:
---   custom    → $XDG_CONFIG_HOME/noctalia/palettes/<name>.json
---   community → $XDG_STATE_HOME/noctalia/community-palettes/<urlEncode(name)>.json
--- (noctalia.string.urlEncode is the same urlEncode noctalia names the cache
--- file with, so the round-trip is exact.)
--- Builtin + wallpaper-generated palettes have no on-disk JSON (they
--- live in the binary / the generator), so those sources keep the fallback
--- accents below.
+-- are resolved with noctalia.getColor against the active palette, whatever its
+-- source. The values below only apply until the first resolve.
 local ACCENTS = { secondary = "EAFF00", primary = "B4FF00", error = "FF4D1F" }
-
-local function xdg(env, fallback)
-  local v = noctalia.getenv and noctalia.getenv(env)
-  if type(v) == "string" and v ~= "" then return v end
-  return noctalia.expandPath(fallback)
-end
 
 local function tr(key, args) return noctalia.tr(key, args) end
 
--- Minimal [theme] reader: walk lines, track the section, keep quoted k/v pairs.
--- (Indented subsections like [theme.templates] end the block; their keys are
--- arrays/bools and would not match the quoted-string pattern anyway.)
-local function theme_cfg(toml)
-  local cfg, in_theme = {}, false
-  for line in (toml .. "\n"):gmatch("([^\n]*)\n") do
-    local sec = line:match("^%s*%[([^%]]+)%]")
-    if sec then
-      in_theme = (sec == "theme")
-    elseif in_theme then
-      local k, v = line:match('^%s*([%w_]+)%s*=%s*"(.-)"')
-      if k then cfg[k] = v end
-    end
-  end
-  return cfg
-end
-
 local function resolve_accents()
-  local toml = noctalia.readFile(xdg("XDG_STATE_HOME", "~/.local/state") .. "/noctalia/settings.toml")
-  if type(toml) ~= "string" then return end
-  local cfg = theme_cfg(toml)
-  local path
-  if cfg.source == "custom" and cfg.custom_palette then
-    path = xdg("XDG_CONFIG_HOME", "~/.config") .. "/noctalia/palettes/" .. cfg.custom_palette .. ".json"
-  elseif cfg.source == "community" and cfg.community_palette then
-    path = xdg("XDG_STATE_HOME", "~/.local/state") .. "/noctalia/community-palettes/"
-        .. noctalia.string.urlEncode(cfg.community_palette) .. ".json"
-  else
-    return -- builtin / wallpaper-generated: keep current accents
+  for role in ACCENTS do
+    local color = noctalia.getColor(role)
+    local rgb = type(color) == "string" and color:match("^#(%x%x%x%x%x%x)$")
+    if rgb then ACCENTS[role] = rgb end
   end
-  local raw = noctalia.readFile(path)
-  if type(raw) ~= "string" then return end
-  local pal = noctalia.json.decode(raw)
-  if type(pal) ~= "table" then return end
-  local m = pal[noctalia.isDarkMode() and "dark" or "light"] or pal.dark or pal
-  if type(m) ~= "table" then return end
-  local function hex(c)
-    return type(c) == "string" and c:match("^#(%x%x%x%x%x%x)$") or nil
-  end
-  ACCENTS.secondary = hex(m.mSecondary) or ACCENTS.secondary
-  ACCENTS.primary = hex(m.mPrimary) or ACCENTS.primary
-  ACCENTS.error = hex(m.mError) or ACCENTS.error
 end
 
 -- ── state map ────────────────────────────────────────────────────────────────
@@ -244,14 +196,14 @@ local function apply(s)
   render()
 end
 
--- Click the dot to show the answer panel — the full-length surface for /claude ?
--- quick-ask answers (the toast only carries a preview; claude.luau publishes the
--- complete text to "claude.answer" and answer.luau renders it scrollable).
+-- Click the dot to ask a one-off question (the ask panel); the answer panel opens
+-- on its own when the reply lands. Left, not middle: Noctalia binds middle click on
+-- every bar widget to its settings, which swallows it before onMiddleClick runs.
 -- panel-OPEN, not -toggle: open is idempotent, so it survives the click handler
 -- firing more than once per click (a toggle nets out to closed again — click
 -- appeared dead in live testing). Dismiss is click-outside/Esc, panel idiom.
 function onClick()
-  if not noctalia.runAsync("noctalia msg panel-open 'lowcache/claude-companion:answer'") then
+  if not noctalia.runAsync("noctalia msg panel-open 'lowcache/claude-companion:ask'") then
     noctalia.notifyError(tr("pulse.title"), tr("pulse.panel_launch_failed"))
   end
 end
@@ -263,17 +215,6 @@ end
 -- gate covers the DECLARATIVE `actions` manifest table, not these globals).
 function onRightClick()
   if not noctalia.runAsync("noctalia msg panel-open 'lowcache/claude-companion:sessions'") then
-    noctalia.notifyError(tr("pulse.title"), tr("pulse.panel_launch_failed"))
-  end
-end
-
--- Middle-click opens the ask panel. Quick-ask was only reachable as `/claude ? …`,
--- which meant opening the launcher, typing a prefix and remembering the `?` — a lot
--- of ceremony for the lightest thing here, and the reason the feature went unused.
--- Same panel-open (not -toggle) reasoning as onClick above. Left is the answer,
--- right is sessions, middle was free.
-function onMiddleClick()
-  if not noctalia.runAsync("noctalia msg panel-open 'lowcache/claude-companion:ask'") then
     noctalia.notifyError(tr("pulse.title"), tr("pulse.panel_launch_failed"))
   end
 end

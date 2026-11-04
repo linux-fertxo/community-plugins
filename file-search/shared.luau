@@ -91,9 +91,43 @@ shared.BUILD_TIMEOUT_DISKS = 1800000
 -- that a disk plugged in mid-session shows up without a manual refresh.
 shared.MOUNT_TTL = 30
 
+-- Whole-system search: the search folder is replaced by "/". Kept apart from
+-- the scope because it answers a different question (how far the local tree
+-- goes, not which disks join it), and persisted the same way, as a one-word
+-- file. A walk of "/" is local but an order of magnitude bigger than a home
+-- folder, so it gets its own timeout.
+shared.BUILD_TIMEOUT_WHOLE = 600000
+
+-- Filesystems a whole-system walk may enter. An allow-list, not a deny-list:
+-- a remote mount (nfs, cifs, sshfs, rclone, onedriver, gvfs…) has many names,
+-- often "fuse.<something>", and a missing entry in a deny-list would stall
+-- the walk on the network. Everything else in /proc/mounts — remote, pseudo
+-- (proc, sysfs, cgroup), overlay and squashfs images — is pruned by path.
+-- fuseblk is ntfs-3g/exfat-fuse on a local block device.
+shared.LOCAL_FS = {
+    ext2 = true, ext3 = true, ext4 = true, btrfs = true, xfs = true,
+    f2fs = true, bcachefs = true, zfs = true, jfs = true, reiserfs = true,
+    nilfs2 = true, vfat = true, msdos = true, exfat = true, ntfs = true,
+    ntfs3 = true, fuseblk = true, hfs = true, hfsplus = true, tmpfs = true,
+}
+
+-- Remote filesystems: pruned from the Search tab's whole-system walk, and from
+-- the Space scan while space_skip_network is on. Any FUSE type ("fuse",
+-- "fuse.<name>": rclone, sshfs, onedriver, gvfsd-fuse) counts too (see
+-- isRemote); fuseblk is a local block device (LOCAL_FS).
+shared.REMOTE_FS = {
+    nfs = true, nfs4 = true, cifs = true, smb3 = true, smbfs = true, davfs = true,
+    ceph = true, glusterfs = true, afs = true, ["9p"] = true, lustre = true,
+}
+
+-- Always pruned from a whole-system walk, whatever /proc/mounts says: kernel
+-- views and runtime state, never user files (and /proc alone is endless).
+shared.WHOLE_SKIP = { "/proc", "/sys", "/dev", "/run" }
+
 -- ── state ────────────────────────────────────────────────────────────────────
 
 shared.scope = shared.DEFAULT_SCOPE
+shared.whole = false        -- whole-system search ("/" instead of the search folder)
 shared.ranking = shared.DEFAULT_RANKING
 -- Whether the installed fzf understands --scheme, decided once per script load
 -- (see probeFzfScheme). False until it answers, and on any fzf too old for it.
@@ -158,6 +192,58 @@ function shared.openPath(path)
     noctalia.runAsync({ "xdg-open", path })
 end
 
+-- file:// URI for a local path. Every byte outside the unreserved set is
+-- percent-encoded one byte at a time, which is also the correct encoding for
+-- the UTF-8 sequences of a non-ASCII name — and it leaves the result free of
+-- quotes and spaces, so it can be dropped into a GVariant literal as-is.
+local function fileUri(path)
+    return "file://" .. (path:gsub("[^%w%-%._~/]", function(byte)
+        return string.format("%%%02X", string.byte(byte))
+    end))
+end
+
+-- Show the entry in the system file manager: its containing folder opens with
+-- the entry itself selected, for a directory too (its parent opens, with the
+-- directory highlighted) — left click is what enters a directory.
+--
+-- ShowItems on the org.freedesktop.FileManager1 interface is the portable way
+-- to say "reveal this": Thunar, Nautilus, Dolphin, Nemo, Caja and PCManFM-Qt
+-- all implement it, and the session bus activates the handler on demand, so
+-- the file manager does not need to be running. When there is no such handler,
+-- or no gdbus at all (execvp failing is a 127 exit like any other), the
+-- fallback opens the containing folder through the MIME association, which is
+-- the same window minus the selection.
+--
+-- An argv (plugin_api >= 24) rather than a shell line: the GVariant literal
+-- carries a file name straight from the index and nothing parses it. That moves
+-- the `||` fallback out of the shell and into the callback.
+function shared.revealPath(path)
+    local parent = path:match("^(.*)/[^/]+$")
+    if parent == nil or parent == "" then
+        parent = "/"
+    end
+    local ok = noctalia.runAsync({
+        "gdbus",
+        "call",
+        "--session",
+        "--dest",
+        "org.freedesktop.FileManager1",
+        "--object-path",
+        "/org/freedesktop/FileManager1",
+        "--method",
+        "org.freedesktop.FileManager1.ShowItems",
+        '["' .. fileUri(path) .. '"]',
+        "",
+    }, function(result)
+        if result.exitCode ~= 0 or result.timedOut then
+            shared.openPath(parent)
+        end
+    end, 5000)
+    if not ok then
+        shared.openPath(parent)
+    end
+end
+
 -- ── fzf capability + scoring ─────────────────────────────────────────────────
 
 -- --scheme=path arrived in fzf 0.36; an older build exits with "unknown option"
@@ -206,10 +292,29 @@ end
 -- every entry can tell a stale index apart. The scope is a word from
 -- SCOPE_GLYPHS, never free text, so it is safe inside the path.
 function shared.cacheSh(dir)
+    local tag = shared.cacheTag()
     return "CACHE_DIR=" .. shared.shellQuote(dir)
-        .. '\nCACHE="$CACHE_DIR/list-' .. shared.scope .. '"'
-        .. '\nMETA="$CACHE_DIR/meta-' .. shared.scope .. '"'
-        .. '\nCOUNTF="$CACHE_DIR/count-' .. shared.scope .. '"'
+        .. '\nCACHE="$CACHE_DIR/list-' .. tag .. '"'
+        .. '\nMETA="$CACHE_DIR/meta-' .. tag .. '"'
+        .. '\nCOUNTF="$CACHE_DIR/count-' .. tag .. '"'
+end
+
+-- The cache file suffix: the scope, plus "-root" for a whole-system index, so
+-- toggling it keeps both indexes instead of re-walking the other one.
+function shared.cacheTag()
+    return (shared.whole and shared.scope ~= "external") and (shared.scope .. "-root") or shared.scope
+end
+
+function shared.readWhole(dir)
+    local raw = noctalia.readFile(dir .. "/whole-system")
+    return type(raw) == "string" and shared.trim(raw) == "on"
+end
+
+function shared.writeWhole(dir, value)
+    local ok, err = noctalia.writeFile(dir .. "/whole-system", value and "on" or "off")
+    if not ok then
+        noctalia.log("file-search: could not persist whole-system search: " .. tostring(err))
+    end
 end
 
 function shared.readScope(dir)
@@ -424,9 +529,15 @@ end
 -- current now" and the later one knows more. In practice neither entry gets
 -- there — the panel serialises through requestReload and the launcher parks the
 -- query itself (probeBusy above).
-function shared.probeMounts(force, done)
-    if shared.scope == "folder" then
+--
+-- `any` (the Space tab) probes whatever the scope: its scan of "/" needs the
+-- removable disks to exclude them.
+function shared.probeMounts(force, done, any)
+    -- A whole-system walk needs the list too, to prune removable disks it would
+    -- otherwise reach under /mnt or /media.
+    if shared.scope == "folder" and not shared.whole and not any then
         shared.mounts = {}
+        shared.mountsAt = 0 -- the list just emptied is not a fresh probe
         done()
         return
     end
@@ -474,9 +585,14 @@ end
 -- mounted inside the search folder (or inside another volume) would otherwise
 -- be walked twice and produce duplicate rows. Sorting puts a parent before its
 -- children, so one pass is enough to drop the nested ones.
+--
+-- A whole-system root is the exception: "/" is the ancestor of every mount, so
+-- the disks are not folded into it. They stay separate roots and the walk of
+-- "/" prunes them (see wholePrunePaths).
 function shared.computeRoots()
     local list = {}
-    if shared.scope ~= "external" then
+    local whole = shared.whole and shared.scope ~= "external"
+    if shared.scope ~= "external" and not whole then
         table.insert(list, shared.searchRoot())
     end
     if shared.scope ~= "folder" then
@@ -498,7 +614,68 @@ function shared.computeRoots()
             table.insert(kept, path)
         end
     end
+    if whole then
+        table.insert(kept, 1, "/")
+    end
     return kept
+end
+
+local function isRemote(fstype)
+    return shared.REMOTE_FS[fstype] or fstype == "fuse" or fstype:sub(1, 5) == "fuse."
+end
+
+-- Paths a walk of "/" must not enter. Always: the fixed kernel/runtime trees
+-- and every pseudo mount (a filesystem neither in LOCAL_FS nor remote: proc,
+-- cgroup, overlay, squashfs…). opts.network adds the remote mounts (see
+-- isRemote), opts.external the removable disks (shared.mounts), which are
+-- either their own root or out of scope. Read from /proc/mounts at build time
+-- only — not part of the fingerprint, so a mount coming and going does not
+-- trigger a rebuild. A path nested in one already pruned is dropped; the walk
+-- never gets there anyway.
+function shared.prunePaths(opts)
+    local list = {}
+    for _, path in ipairs(shared.WHOLE_SKIP) do
+        table.insert(list, path)
+    end
+    local text = noctalia.readFile("/proc/mounts")
+    if type(text) == "string" then
+        for line in text:gmatch("[^\n]+") do
+            local raw, fstype = line:match("^%S+%s+(%S+)%s+(%S+)")
+            if raw ~= nil and not shared.LOCAL_FS[fstype] and (opts.network or not isRemote(fstype)) then
+                local rejected = false
+                local path = raw:gsub("\\(%d%d%d)", function(octal)
+                    local code = tonumber(octal, 8)
+                    if code == nil or code < 32 or code == 127 then
+                        rejected = true
+                        return ""
+                    end
+                    return string.char(code)
+                end)
+                if not rejected and path ~= "/" and path:sub(1, 1) == "/" then
+                    table.insert(list, path)
+                end
+            end
+        end
+    end
+    if opts.external then
+        for _, mount in ipairs(shared.mounts) do
+            table.insert(list, (mount:gsub("/+$", "")))
+        end
+    end
+    table.sort(list)
+    local kept = {}
+    for _, path in ipairs(list) do
+        local last = kept[#kept]
+        if path ~= "" and path ~= last and (last == nil or not shared.startsWith(path, last .. "/")) then
+            table.insert(kept, path)
+        end
+    end
+    return kept
+end
+
+-- The Search tab's whole-system walk: remote mounts and removable disks too.
+function shared.wholePrunePaths()
+    return shared.prunePaths({ network = true, external = true })
 end
 
 -- Everything that decides how the cache was built. Its two lists are joined
@@ -514,7 +691,7 @@ end
 -- The cache on disk is current when its fingerprint matches, whichever entry
 -- built it.
 function shared.cacheFresh(dir)
-    return noctalia.readFile(dir .. "/meta-" .. shared.scope) == shared.indexKey()
+    return noctalia.readFile(dir .. "/meta-" .. shared.cacheTag()) == shared.indexKey()
 end
 
 -- The roots the index on disk was built with, read back out of its fingerprint,
@@ -524,7 +701,7 @@ end
 -- the current mount list would make every row unopenable — including the rows
 -- of the disk still attached — until the next rebuild.
 function shared.indexRootsOf(dir)
-    local meta = noctalia.readFile(dir .. "/meta-" .. shared.scope)
+    local meta = noctalia.readFile(dir .. "/meta-" .. shared.cacheTag())
     if type(meta) ~= "string" then
         return nil
     end
@@ -582,7 +759,10 @@ end
 
 -- Seconds a walk of the current scope is allowed to take.
 function shared.buildTimeout()
-    return (shared.scope == "folder") and shared.BUILD_TIMEOUT_LOCAL or shared.BUILD_TIMEOUT_DISKS
+    if shared.scope ~= "folder" then
+        return shared.BUILD_TIMEOUT_DISKS
+    end
+    return shared.whole and shared.BUILD_TIMEOUT_WHOLE or shared.BUILD_TIMEOUT_LOCAL
 end
 
 -- The tree walk, written for `key` as the fingerprint it will leave behind.
@@ -613,6 +793,16 @@ function shared.buildCommand(dir, key, absolute)
     for _, name in ipairs(shared.excludeNames()) do
         table.insert(names, "-name " .. shared.shellQuote(name))
     end
+    -- A whole-system walk also prunes mount points by full path. -path takes a
+    -- glob, so the glob characters a mount point may contain are escaped.
+    -- stderr goes to /dev/null below: the permission-denied lines a walk of
+    -- "/" produces by the thousand are expected and never fail the build.
+    if shared.whole and shared.roots[1] == "/" then
+        for _, path in ipairs(shared.wholePrunePaths()) do
+            local glob = path:gsub("[%*%?%[%]\\]", "\\%0")
+            table.insert(names, "-path " .. shared.shellQuote(glob))
+        end
+    end
     local prune = "\\( " .. table.concat(names, " -o ") .. " \\) -prune -o "
     local args = {}
     for _, root in ipairs(shared.roots) do
@@ -636,10 +826,10 @@ function shared.buildCommand(dir, key, absolute)
         -- Timed here rather than around runAsync: this is the walk itself,
         -- without the queueing and callback hops the shell knows nothing about.
         .. 'START=$(date +%s%3N)\n'
-        .. 'TMP=$(mktemp "$CACHE_DIR/list-' .. shared.scope .. '.XXXXXX") || exit 1\n'
+        .. 'TMP=$(mktemp "$CACHE_DIR/list-' .. shared.cacheTag() .. '.XXXXXX") || exit 1\n'
         .. walk .. "\n"
         .. 'mv -f "$TMP" "$CACHE" || exit 1\n'
-        .. 'TMPM=$(mktemp "$CACHE_DIR/meta-' .. shared.scope .. '.XXXXXX") || exit 1\n'
+        .. 'TMPM=$(mktemp "$CACHE_DIR/meta-' .. shared.cacheTag() .. '.XXXXXX") || exit 1\n'
         .. "printf '%s' " .. shared.shellQuote(key) .. ' > "$TMPM"\n'
         .. 'mv -f "$TMPM" "$META" || exit 1\n'
         -- The count is taken here, while the file is already hot, and left in a
@@ -647,7 +837,7 @@ function shared.buildCommand(dir, key, absolute)
         -- reads a dozen bytes instead of the whole index.
         .. 'COUNT=$(wc -l < "$CACHE") || exit 1\n'
         .. 'ELAPSED=$(( $(date +%s%3N) - START ))\n'
-        .. 'TMPN=$(mktemp "$CACHE_DIR/count-' .. shared.scope .. '.XXXXXX") || exit 1\n'
+        .. 'TMPN=$(mktemp "$CACHE_DIR/count-' .. shared.cacheTag() .. '.XXXXXX") || exit 1\n'
         .. 'printf "%s %s" "$COUNT" "$ELAPSED" > "$TMPN"\n'
         .. 'mv -f "$TMPN" "$COUNTF" || exit 1\n'
         .. 'printf "%s %s" "$COUNT" "$ELAPSED"'

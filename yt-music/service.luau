@@ -34,8 +34,18 @@ local function log_boot_env()
 	noctalia.runAsync("noctalia --version 2>/dev/null | head -1", function(res)
 		local out = (type(res) == "table" and res.stdout) or ""
 		local host = out:match("noctalia%s+(v?[%d%.]+)") or "?"
-		log("env: noctalia=" .. host .. " plugin=" .. plugin_ver .. " os=\"" .. os_name
-			.. "\" desktop=" .. desktop .. " session=" .. session)
+		log(
+			"env: noctalia="
+				.. host
+				.. " plugin="
+				.. plugin_ver
+				.. ' os="'
+				.. os_name
+				.. '" desktop='
+				.. desktop
+				.. " session="
+				.. session
+		)
 	end)
 end
 
@@ -50,6 +60,7 @@ local downloader = require("./modules/downloader.luau")
 local playlist = require("./modules/playlist.luau")
 local search = require("./modules/search.luau")
 local cacheops = require("./modules/cacheops.luau")
+local const = require("./api/constants.luau")
 
 local ACTIONS = {
 	extract = function(r)
@@ -67,15 +78,21 @@ local ACTIONS = {
 	play_next = function(r)
 		player.play_next(r.item or {})
 	end,
+	add_to_queue = function(r)
+		player.add_to_queue(r.item or {})
+	end,
 	play_suggestion = function(r)
 		player.play_now(r.item or {})
 	end,
 	play_queue_index = function(r)
 		player.play_index(r.index or 1)
 	end,
-	play_with_queue = function(r)
+	move_queue_item = function(r)
+		player.move(r.from, r.to)
+	end,
+	replace_queue_and_play = function(r)
 		if r.queue and #r.queue > 0 then
-			playlist.play_queue(r.queue, r.index, r.source_playlist)
+			playlist.play_queue(r.queue, r.index, r.source_playlist, r.filtered)
 		elseif r.item then
 			player.play(r.item)
 		end
@@ -88,6 +105,20 @@ local ACTIONS = {
 	end,
 	refresh_playlist = function(r)
 		playlist.refresh(r.id or r.playlist_id)
+	end,
+	refresh_library = function(r)
+		if not network.isOnline() then
+			log("refresh_library: skipped because offline")
+			return
+		end
+		if state.refreshing_library then
+			return
+		end
+		if api and api.library then
+			state.refreshing_library = true
+			store.publish()
+			api.library()
+		end
 	end,
 	fetch_next_page = function(r)
 		playlist.fetch_next_page(r.playlist_id, r.token)
@@ -118,6 +149,21 @@ local ACTIONS = {
 			else
 				downloader.enqueue(vid, "", r.item)
 			end
+		end
+	end,
+	remove_download = function(r)
+		local vid = (r.item and r.item.id) or r.id or r.video_id
+		if vid and vid ~= "" then
+			local path = const.AUDIO_DIR .. "/" .. vid .. ".opus"
+			if noctalia.fileExists(path) then
+				noctalia.removeFile(path)
+			end
+			if state.offline_meta then
+				state.offline_meta[vid] = nil
+				library.save_offline_meta()
+			end
+			library.sync_audio_cache()
+			cacheops.fetch_stats()
 		end
 	end,
 	download_playlist = function(r)
@@ -165,16 +211,22 @@ local ACTIONS = {
 		if bid == "" then
 			return
 		end
-		state.artist =
-			{ id = bid, title = tostring(r.title or "Artist"), thumbnail_url = r.thumbnail_url or "", thumb_path = r.thumb_path or nil }
-		
+		state.artist = {
+			id = bid,
+			title = tostring(r.title or "Artist"),
+			thumbnail_url = r.thumbnail_url or "",
+			thumb_path = r.thumb_path or nil,
+		}
+
 		local cached = api and api.load_cached_artist and api.load_cached_artist(bid)
 		if cached then
 			if type(cached.artist) == "table" then
 				if cached.artist.thumb_path and noctalia.fileExists(cached.artist.thumb_path) then
 					state.artist.thumb_path = cached.artist.thumb_path
 				end
-				if (not state.artist.thumbnail_url or state.artist.thumbnail_url == "") and cached.artist.thumbnail_url then
+				if
+					(not state.artist.thumbnail_url or state.artist.thumbnail_url == "") and cached.artist.thumbnail_url
+				then
 					state.artist.thumbnail_url = cached.artist.thumbnail_url
 				end
 			end
@@ -195,7 +247,10 @@ local ACTIONS = {
 			state.artist_related = res.related or {}
 			store.publish()
 			if api and api.save_artist_cache then
-				api.save_artist_cache(bid, { artist = state.artist, tracks = state.artist_tracks, related = state.artist_related })
+				api.save_artist_cache(
+					bid,
+					{ artist = state.artist, tracks = state.artist_tracks, related = state.artist_related }
+				)
 			end
 			local items = { state.artist }
 			for _, t in ipairs(state.artist_tracks) do
@@ -225,29 +280,36 @@ noctalia.state.watch(REQ_KEY, function(req)
 		return
 	end
 	handled_nonce = req.nonce
-	log("request nonce=" .. req.nonce .. " action=" .. tostring(req.action))
+	local action = tostring(req.action or "")
+	log("request nonce=" .. req.nonce .. " action=" .. action)
 
-	local handler = ACTIONS[tostring(req.action or "")]
+	local handler = ACTIONS[action]
 	if handler then
-		handler(req)
+		noctalia.runAsync("true", function()
+			local ok, err = pcall(handler, req)
+			if not ok then
+				log("request error in '" .. action .. "': " .. tostring(err))
+			end
+		end)
 	else
-		log("request: unhandled action '" .. tostring(req.action) .. "'")
+		log("request: unhandled action '" .. action .. "'")
 	end
 end)
 
 function update()
 	if api.library_pending() then
 		api.finish_library(function(playlists)
-			state.library = type(playlists) == "table" and playlists or {}
-			store.publish()
-			if type(playlists) == "table" then
+			state.refreshing_library = false
+			if type(playlists) == "table" and #playlists > 0 then
+				state.library = playlists
 				log("ytmusic: loaded " .. #playlists .. " library playlists")
 				noctalia.runAsync("true", function()
 					api.ensure_thumbnails(state.library, store.publish, "library")
 				end)
 			else
-				log("ytmusic: library decode failed")
+				log("ytmusic: library fetch failed or empty, keeping existing library")
 			end
+			store.publish()
 		end)
 	end
 
@@ -257,7 +319,7 @@ function update()
 	if probe_tick >= 20 then
 		probe_tick = 0
 		noctalia.runAsync(
-			"curl -s -o /dev/null -m 3 https://music.youtube.com && echo 'NET=UP' || echo 'NET=DOWN'",
+			"curl -s -o /dev/null -m 6 https://music.youtube.com && echo 'NET=UP' || echo 'NET=DOWN'",
 			function(res)
 				local out = (type(res) == "table" and res.stdout) or ""
 				local now_online = out:find("NET=UP", 1, true) ~= nil
@@ -277,6 +339,10 @@ noctalia.setUpdateInterval(1000)
 
 log("boot: service started, api=" .. tostring(type(api)) .. " library=" .. tostring(type(api and api.library)))
 log_boot_env()
+if noctalia.fileExists(const.COOKIE_PATH) then
+	state.status = "ready"
+	state.cookies_path = const.COOKIE_PATH
+end
 mpv.kill()
 library.load_offline_meta()
 auth.detect_browsers()

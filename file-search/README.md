@@ -7,7 +7,8 @@ panel; picking a result opens it with the system MIME association
 (`xdg-open`) — directories open in the file manager. A `/fs` launcher entry
 gives the same search with native keyboard navigation. The panel can widen
 the search to mounted USB/removable disks, and show a disk-usage donut for
-the search folder.
+the search folder. A second panel tab, **Space**, browses disk usage with
+`ncdu`: a donut, a sortable folder list and a file-type view.
 
 ## Plugin
 
@@ -38,10 +39,14 @@ plugin. Use the panel's settings button, or the command below.
 
 ### The panel
 
-| Key     | Action                             |
-|---------|--------------------------------------|
-| `Enter` | Open the top match                 |
-| `Esc`   | Close the panel (noctalia default) |
+| Key     | Action                                                  |
+|---------|---------------------------------------------------------|
+| ↑ / ↓   | Move the selection through the results (hold to repeat) |
+| `Enter` | Open the selected result (the top match until moved)    |
+| `Esc`   | Close the panel (noctalia default)                      |
+
+The list scrolls to keep the selection in view. The mouse wheel still scrolls
+freely; the next ↑ or ↓ brings the selection back.
 
 Header buttons, left to right:
 
@@ -49,13 +54,14 @@ Header buttons, left to right:
 |---|---|---|
 | 🗠/🗺 | Ranking | Switches how matches are scored (see *Search syntax*) |
 | ◕ | Usage chart | Shows/hides the disk-usage donut |
+| 🌐 | Whole system | Searches all of `/` instead of the search folder (see *Whole-system search*) |
 | 🗀 | Scope | Cycles what the search covers (see *Searching external disks*) |
 | ↻ | Refresh | Rebuilds the index (and, on the folder scope, re-measures disk usage) |
 | ⚙ | Settings | Opens this plugin's page in *Settings → Plugins* (same as `noctalia msg settings-open-plugin nightwatch75/file-search`) |
 | ✕ | Close | Closes the panel |
 
-Every choice made from these buttons (ranking, scope, usage chart shown or
-not) survives a restart. The plugin version sits next to the panel title; the
+Every choice made from these buttons (ranking, whole system, scope, usage
+chart shown or not) survives a restart. The plugin version sits next to the panel title; the
 footer shows how many results are listed, how many entries are indexed, and
 how long the last index build took.
 
@@ -151,6 +157,23 @@ walked — a mount point under the search folder is skipped and named in the
 legend as *not counted: … (other filesystem)*. The `usage_exclude_dirs`
 setting keeps `du` out of specific, slow-but-same-filesystem folders instead.
 
+### Space tab
+
+You can turn this tab off with the `space_enabled` setting.
+
+The *Space* tab shows what fills the disk. It starts with your home folder;
+the `/` button switches to the whole system. A donut and a clickable legend show the biggest
+items of the current folder; click a folder to go in, use the up arrow to go
+back, or the top arrow to jump to the top of the home folder. The buttons are under the
+donut; the list on the right sorts by size or name. In the file list of a type,
+*Name* sorts by the file name and *Path* by the full path. *Folders | Types* switches to a
+view by file type (video, images, audio…) and lists the 10 biggest files of a
+type; a line above the list says when it shows only those 10. When all the
+files listed are in one folder, that folder is shown once above the list. The search button goes back to the Search tab and
+restricts the search to the current folder, if it is inside the search folder;
+for any other folder it shows a notice. Right-click a row of the list for
+open / show in file manager / copy path / copy name.
+
 ### Launcher
 
 ```
@@ -187,17 +210,21 @@ results whenever the index is out of date.
 | `search_folder` | `folder` | *(empty)* | Root folder the search indexes. Empty = your home folder. |
 | `exclude_dirs` | `string` | `.git, node_modules, .cache, .venv` | Folder names skipped while indexing, separated by `,` or `;`, matched anywhere in the tree. |
 | `show_hidden` | `bool` | `false` | Index files and folders whose name starts with a dot. |
-| `usage_exclude_dirs` | `string` | *(empty)* | Folders left out of the disk usage chart, separated by `,` or `;`. A bare name matches anywhere below the search folder; a path (absolute, or starting with `~`) matches that one folder. Folders on another filesystem are already skipped. |
+| `usage_exclude_dirs` | `string` | *(empty)* | Folders left out of the usage chart and the Space scan, separated by `,` or `;`. A name matches anywhere below the search folder. An absolute or `~` path skips that one folder, e.g. a disk under `/mnt`. |
+| `space_enabled` | `bool` | `true` | Show the Space tab. Turn it off to use only the search: the tab bar is hidden and nothing is scanned. The panel keeps its width. |
+| `space_skip_network` | `bool` | `true` | Space tab: do not scan network mounts (NFS, SMB…) and FUSE mounts (rclone, sshfs, OneDrive…). |
+| `space_skip_external` | `bool` | `true` | Space tab: do not scan external (removable) disks. |
 | `max_results` | `int` | `50` | How many matches the panel lists at most (10–200). |
 | `glyph` (widget) | `glyph` | `search` | Icon shown on the bar. |
 
 ## Requirements
 
-- noctalia with `plugin_api = 28` (v5.0.0-beta.9 or newer; on beta.8 the
-  plugin store keeps serving 0.0.29) — for the row context menu, relative
-  Luau imports (the three entries share `shared.luau`) and direct argv
-  process execution, so `du`, `xdg-open` and the reveal call take their
-  arguments with no shell parsing them
+- noctalia with `plugin_api = 33` (the release after v5.2.1 that adds
+  `revealKey` on `ui.scroll`, which keeps the keyboard selection in view; an
+  older shell keeps being served the last version it can load) — also for
+  the row context menu, relative Luau imports (the three entries share
+  `shared.luau`) and direct argv process execution, so `du`, `xdg-open` and
+  the reveal call take their arguments with no shell parsing them
 - [`fzf`](https://github.com/junegunn/fzf) — the fuzzy matcher. 0.36 or newer
   for path-aware ranking; older builds work with fzf's default ranking
 - `find` (GNU findutils) — walks the roots into the index
@@ -205,6 +232,12 @@ results whenever the index is out of date.
 - `mktemp`, `mv`, `wc`, `head`, `rm`, `date`, `du` — GNU coreutils, standard
   on any Linux desktop. Missing `du`, the usage chart says so; everything
   else still works
+- [`ncdu`](https://dev.yorhel.nl/ncdu) 2.0 or newer — scans the disk for the
+  Space tab (needed only for the Space tab)
+- [`jq`](https://jqlang.github.io/jq/) — reduces the scan to the Space index
+  (needed only for the Space tab)
+- `nice` (GNU coreutils) — runs the scan at low priority (needed only for the
+  Space tab)
 - `lsblk` (util-linux) — lists mounted USB/removable volumes, only run when
   the scope includes them. Missing, it falls back to `/proc/mounts` and the
   udisks2 layout (`/run/media/<user>/…`, `/media/…`)
@@ -226,8 +259,40 @@ noctalia msg plugins source add dev path /path/to/plugins
 noctalia msg plugins enable nightwatch75/file-search
 ```
 
+### Whole-system search
+
+The 🌐 button searches all of `/` instead of the search folder. It is off by
+default. `/proc`, `/sys`, `/dev`, `/run`, remote and FUSE mounts (NFS, CIFS,
+sshfs, rclone, OneDrive…) and removable disks stay excluded. Unreadable
+folders are skipped.
+
 ## Notes
 
+- The Space tab scans your home folder with `ncdu` on its first use; a scan
+  of `/` takes about 45 s on a fast PC. `jq` can use up to about 1.5 GB RAM for a moment. Both run at low
+  priority. The index is cached for one day; refresh forces a rescan.
+- The Space progress bar is an estimate from the duration of the last scan of
+  the same folder and settings. The first scan shows only the elapsed time.
+- The Space list shows how many files each folder holds (links and symlinks
+  count once per name).
+- Network, FUSE and external mounts are skipped by default
+  (`space_skip_network`, `space_skip_external`). Pseudo filesystems (`/proc`,
+  overlay, squashfs…) are always skipped.
+- The Space scan also leaves out the folders in "Disk usage: excluded
+  folders". Each combination of these three settings has its own cached
+  index: after a change, the Space tab starts a new scan when it opens.
+- Folders under 1 MiB, or under 0.05% of their parent folder, are counted in
+  "(files and small folders)". Drill-down stops at depth 6.
+- If the disk index is too big for the plugin (very large disks), the tab
+  asks you to skip more folders in the settings. A normal index is about
+  4 MB and takes about 25 MB of plugin memory while it loads.
+- `ncdu`, `jq` and `nice` are searched in `/usr/bin`, `/usr/local/bin`, `/bin`
+  and `~/.local/bin` only: a detached run has no login PATH. Tested with
+  `jq` 1.8.
+- Hard-linked files have their size split between the links, so a folder total
+  can differ from the `ncdu` screen. The root total stays exact.
+- A folder that `ncdu` cannot read (permission denied) counts as 0 bytes. The
+  Space tab shows how many such folders the current folder contains.
 - The index lives in the plugin's private data directory
   (`noctalia.pluginDataDir()`, by default
   `~/.local/state/noctalia/plugins/data/nightwatch75/file-search/`):
@@ -235,7 +300,8 @@ noctalia msg plugins enable nightwatch75/file-search
   it was built with, `count-<scope>` its entry count and build time, and
   `scope`/`ranking`/`usage-chart` the one-word header choices. The disk usage
   measurement is cached in `usage.json`, rendered as one of two alternating
-  SVG files. A fingerprint mismatch (a settings change, a scope change, a
+  SVG files. The Space tab keeps one index per folder and settings
+  tag, `space-<root>-<tag>.json`, and its chart in `space-a.svg` / `space-b.svg`. A fingerprint mismatch (a settings change, a scope change, a
   disk plugged in or removed) rebuilds the search-folder index automatically
   and marks a disk index out of date.
 - Several disks share one index, not one each: a rebuild walks every mounted

@@ -37,7 +37,6 @@ local function remember_saved_meta(id, meta)
 		duration = tonumber(meta.duration) or existing.duration or 0,
 		thumbnail_url = meta.thumbnail_url or existing.thumbnail_url,
 	}
-	library.save_offline_meta()
 end
 
 local function note_offline_row(id, meta)
@@ -81,19 +80,37 @@ function Downloader.register_explicit(id, meta)
 		duration = (meta and tonumber(meta.duration)) or existing.duration,
 		thumbnail_url = (meta and meta.thumbnail_url) or existing.thumbnail_url,
 	})
+	if state.cached_tracks then
+		local new_cached = {}
+		for _, tr in ipairs(state.cached_tracks) do
+			if tr.id ~= id then
+				table.insert(new_cached, tr)
+			end
+		end
+		state.cached_tracks = new_cached
+	end
+	if library and library.remove_from_cached_meta then
+		library.remove_from_cached_meta(id)
+	end
 	publish()
 end
 
 local function pl_done(plid)
-	local is_inflight = false
+	if not plid or plid == "" then
+		return false
+	end
+	for _, item in ipairs(queue) do
+		if item.plid == plid then
+			return false
+		end
+	end
 	for vid, pid in pairs(inflight) do
 		if pid == plid then
-			is_inflight = true
-			break
+			return false
 		end
 	end
 	pending[plid] = nil
-	return not is_inflight
+	return true
 end
 
 local function unlock_playlist(plid)
@@ -128,6 +145,7 @@ local function pump()
 				else
 					log("download: failed for id=" .. tostring(id))
 				end
+				publish()
 				if pl_done(plid) then
 					if plid ~= "" then
 						unlock_playlist(plid)
@@ -138,6 +156,17 @@ local function pump()
 				end
 				pump()
 			end)
+		else
+			if plid ~= "" and pl_done(plid) then
+				unlock_playlist(plid)
+			end
+		end
+	end
+	if active == 0 and #queue == 0 then
+		for pid in pairs(state.downloading_playlist_ids) do
+			if pl_done(pid) then
+				unlock_playlist(pid)
+			end
 		end
 	end
 end
@@ -149,6 +178,9 @@ function Downloader.enqueue(id, plid, meta)
 	local pid = plid or ""
 	if meta then
 		remember_saved_meta(id, meta)
+		if pid == "" then
+			library.save_offline_meta()
+		end
 	end
 	if state.cached_audio_ids[id] then
 		return
@@ -173,6 +205,7 @@ function Downloader.enqueue_playlist(tracks, plid)
 		end
 	end
 	if queued > 0 then
+		library.save_offline_meta()
 		publish()
 	end
 	log("download_playlist: queued " .. queued .. " tracks")

@@ -46,6 +46,14 @@ local classify = loadSlice("local inFlight", "classify")
 
 -- Each case names the material that must not survive.
 local SECRETS = {
+    { 'password="synthetic first second"', "first second" },
+    { "client_secret='synthetic first second'", "first second" },
+    { '{"access_token": "synthetic first second"}', "first second" },
+    { 'password="synthetic \\" second"', "second" },
+    { 'password="synthetic ' .. string.rep('x', 250), "synthetic" },
+    { 'Cookie: session=synthetic-session-value; other=private', "synthetic-session-value" },
+    { 'Set-Cookie: session=synthetic-session-value; HttpOnly', "synthetic-session-value" },
+    { 'Authorization: Digest username="synthetic-user", response="synthetic-response"', "synthetic-response" },
     { "GET /v1/usage?api_key=sk-ant-abc123456 failed", "abc123456" },
     { "request token=eyJhbGciOiJIUzI1NiJ9.SIGNATURE failed", "SIGNATURE" },
     { "client_secret=hunter2 rejected", "hunter2" },
@@ -123,6 +131,23 @@ local failures = 0
 local function fail(message)
     failures = failures + 1
     io.write("FAIL  ", message, "\n")
+end
+
+local structured = scrub({ nested = {
+    access_token = "synthetic-structured-secret",
+    API_KEY = "synthetic-api-key",
+    password = { value = "synthetic-nested-password" },
+    Authorization = "Digest synthetic-auth",
+    cookie = "session=synthetic-cookie",
+    input_tokens = 45000,
+    tokens_used = "1500",
+    api_key_tokens = 42,
+} })
+for _, name in ipairs({ "access_token", "API_KEY", "password", "Authorization", "cookie", "api_key_tokens" }) do
+    if structured.nested[name] ~= "<redacted>" then fail("sensitive field not redacted: " .. name) end
+end
+if structured.nested.input_tokens ~= 45000 or structured.nested.tokens_used ~= "1500" then
+    fail("structured token counts must retain their values and types")
 end
 
 -- A healthy usage entry is reported as `ok` by the CLI. Only `error` is a
@@ -210,13 +235,9 @@ end
 scrub(sampleReport())
 string.gsub = realGsub
 
--- Bytes, not calls: the count barely moves, since normalising whitespace is one
--- gsub per string either way. What moves is how much text the patterns are handed,
--- 37352 bytes for this report before the rewrite against 17664 after. The ceiling
--- sits between the two, near enough that widening the gate back to all four
--- keywords at once (22400) trips it as surely as moving the cap back after the
--- patterns (37352).
-local MAX_BYTES = 20000
+-- Repeated labels and reset details should only be scrubbed once per report.
+-- Without that cache this fixture hands 17664 bytes to gsub; with it, 10080.
+local MAX_BYTES = 12000
 if bytes > MAX_BYTES then
     fail("the redaction patterns were handed " .. bytes .. " bytes of a four-vendor report"
         .. " in " .. calls .. " gsub calls, past the " .. MAX_BYTES .. " bytes this callback"

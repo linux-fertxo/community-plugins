@@ -5,6 +5,7 @@
 
 -- `ai-usagebar` is a declared dependency, so it is expected on PATH.
 local COMMAND = "ai-usagebar usage --json"
+local shared = require("./shared.luau")
 
 local function intervalMs()
     local minutes = tonumber(noctalia.getConfig("refresh_minutes")) or 5
@@ -30,6 +31,7 @@ for _, word in ipairs({ "key", "token", "secret", "password" }) do
         -- Each keyword redacts on a pass of its own, so `api_key_tokens` has this
         -- exemption taken back by the `key` pass.
         keepsReadings = word == "token",
+        quoted = "(" .. name .. "[\"']?%s*[:=]%s*)[\"'].*",
         -- name=value: query string, shell assignment, or the CLI's own TOML.
         assign = "(" .. name .. "%s*=%s*[\"']?)" .. SECRET_VALUE,
         -- name: value: an HTTP header or a JSON field. Captured rather than
@@ -37,8 +39,10 @@ for _, word in ipairs({ "key", "token", "secret", "password" }) do
         colon = "(" .. name .. "[\"']?%s*:%s*[\"']?)(" .. SECRET_VALUE .. ")",
     }
 end
-local BASIC_AUTH_PATTERN = "(" .. anyCase("authorization") .. "[\"']?%s*:%s*[\"']?"
-    .. anyCase("basic") .. "%s+)" .. SECRET_VALUE
+local HEADER_PATTERNS = {}
+for _, word in ipairs({ "authorization", "cookie" }) do
+    HEADER_PATTERNS[word] = "(" .. anyCase(word) .. "[\"']?%s*[:=]%s*).*"
+end
 
 -- A quota is not a credential, but the exemption stays narrow: short, digits
 -- only, and offered to labels that count tokens. The plural separates the two --
@@ -72,6 +76,11 @@ local function safeText(value)
 
     for _, secret in ipairs(SECRET_PATTERNS) do
         if lower:find(secret.word, 1, true) then
+            -- Fail closed on quoted diagnostics, including escaped quotes and
+            -- values cut by the length cap: omit the remainder of the line.
+            if text:find('"', 1, true) or text:find("'", 1, true) then
+                text = text:gsub(secret.quoted, "%1<redacted>")
+            end
             text = text:gsub(secret.assign, "%1<redacted>")
             text = text:gsub(secret.colon, secret.keepsReadings and redactColon or "%1<redacted>")
         end
@@ -81,8 +90,8 @@ local function safeText(value)
         text = text:gsub("([Bb][Ee][Aa][Rr][Ee][Rr]%s+)" .. SECRET_VALUE, "%1<redacted>")
     end
 
-    if lower:find("authorization", 1, true) and lower:find("basic", 1, true) then
-        text = text:gsub(BASIC_AUTH_PATTERN, "%1<redacted>")
+    for word, pattern in pairs(HEADER_PATTERNS) do
+        if lower:find(word, 1, true) then text = text:gsub(pattern, "%1<redacted>") end
     end
 
     -- Credentials in the userinfo half of a URL the CLI echoed back.
@@ -99,10 +108,28 @@ local function safeText(value)
 end
 
 -- Every string, not just the error: a plan name is CLI text too.
-local function scrub(value)
-    if type(value) == "string" then return safeText(value) end
+local function scrub(value, cache)
+    cache = cache or {}
+    if type(value) == "string" then
+        if cache[value] == nil then cache[value] = safeText(value) end
+        return cache[value]
+    end
     if type(value) ~= "table" then return value end
-    for key, inner in pairs(value) do value[key] = scrub(inner) end
+    for key, inner in pairs(value) do
+        local sensitive = false
+        if type(key) == "string" then
+            local lower = key:lower()
+            sensitive = lower:find("authorization", 1, true) ~= nil
+                or lower:find("cookie", 1, true) ~= nil
+            for _, secret in ipairs(SECRET_PATTERNS) do
+                if lower:find(secret.word, 1, true)
+                    and not (secret.keepsReadings and isReading(key .. ":", tostring(inner))) then
+                    sensitive = true
+                end
+            end
+        end
+        if sensitive then value[key] = "<redacted>" else value[key] = scrub(inner, cache) end
+    end
     return value
 end
 
@@ -130,6 +157,59 @@ local function classify(result)
     return failure("no_data", stderr)
 end
 
+-- The setup view asks for this local catalog; quota ticks never collect it.
+local catalogInFlight = false
+local lastCatalogStart = nil
+
+local function publicCatalog(document)
+    if type(document) ~= "table" or type(document.vendors) ~= "table" then return nil end
+    local vendors, count = {}, 0
+    for key, vendor in pairs(document.vendors) do
+        if type(key) ~= "number" or key % 1 ~= 0 or key < 1 or key > #document.vendors
+            or type(vendor) ~= "table" then return nil end
+        count = count + 1
+    end
+    if count ~= #document.vendors then return nil end
+    for _, vendor in ipairs(document.vendors) do
+        if type(vendor.id) ~= "string" or #vendor.id > 80
+            or not vendor.id:match("^[a-z0-9][a-z0-9_%-]*$")
+            or type(vendor.name) ~= "string"
+            or type(vendor.enabled) ~= "boolean"
+            or type(vendor.configured) ~= "boolean"
+            or type(vendor.needs_credential) ~= "boolean" then return nil end
+        vendors[#vendors + 1] = {
+            id = vendor.id,
+            name = safeText(vendor.name),
+            enabled = vendor.enabled,
+            configured = vendor.configured,
+            needs_credential = vendor.needs_credential,
+        }
+    end
+    return { vendors = vendors }
+end
+
+local function loadCatalog()
+    local now = noctalia.nowMs()
+    if catalogInFlight or (lastCatalogStart ~= nil and now - lastCatalogStart < 2000) then return end
+    catalogInFlight = true
+    lastCatalogStart = now
+    noctalia.state.set("catalog_loading", true)
+    local started = noctalia.runAsync("ai-usagebar vendors --json", function(result)
+        local decoded = result ~= nil and not result.timedOut and result.exitCode == 0
+            and noctalia.json.decode(result.stdout or "") or nil
+        local catalog = publicCatalog(decoded)
+        if catalog ~= nil then noctalia.state.set("catalog", catalog) end
+        noctalia.state.set("catalog_error", catalog == nil)
+        catalogInFlight = false
+        noctalia.state.set("catalog_loading", false)
+    end, 5000)
+    if not started then
+        catalogInFlight = false
+        noctalia.state.set("catalog_error", true)
+        noctalia.state.set("catalog_loading", false)
+    end
+end
+
 local inFlight = false
 local pendingRefresh = false
 
@@ -142,6 +222,27 @@ local function queueRefresh()
     pendingRefresh = true
     noctalia.state.set("refresh_queued", true)
     noctalia.setUpdateInterval(250)
+end
+
+local function keepAntigravityReading(report)
+    local previous = noctalia.state.get("report")
+    if type(previous) ~= "table" or type(previous.entries) ~= "table" then return end
+    for index, entry in ipairs(report.entries) do
+        if type(entry) == "table" and shared.baseProvider(entry.id) == "antigravity"
+            and shared.warning(entry):lower():find("no local server found", 1, true) then
+            for _, old in ipairs(previous.entries) do
+                if type(old) == "table" and old.id == entry.id
+                    and not shared.unavailable(old) and type(old.metrics) == "table"
+                    and #old.metrics > 0 then
+                    local cached = {}
+                    for key, value in pairs(old) do cached[key] = value end
+                    cached.stale = true
+                    report.entries[index] = cached
+                    break
+                end
+            end
+        end
+    end
 end
 
 local function refresh()
@@ -170,7 +271,9 @@ local function refresh()
         if type(decoded) == "table" and type(decoded.entries) == "table" then
             -- A failed vendor still comes back as an entry with `status = "error"`,
             -- so a non-zero exit is no reason to drop the report.
-            noctalia.state.set("report", scrub(decoded))
+            local safeReport = scrub(decoded)
+            keepAntigravityReading(safeReport)
+            noctalia.state.set("report", safeReport)
             noctalia.state.set("error", failure(""))
         else
             noctalia.state.set("error", classify(result))
@@ -192,6 +295,7 @@ end
 
 noctalia.state.watch("command", function(value)
     if type(value) == "table" and value.action == "refresh" then refresh() end
+    if type(value) == "table" and value.action == "catalog" then loadCatalog() end
 end)
 
 function update()
@@ -207,6 +311,7 @@ end
 
 function onIpc(event, payload)
     if event == "refresh" then refresh() end
+    if event == "catalog" then loadCatalog() end
     -- `select <provider-id>` points the panel at one provider from a script.
     if event == "select" and type(payload) == "string" and payload ~= "" then
         noctalia.state.set("selected", payload)

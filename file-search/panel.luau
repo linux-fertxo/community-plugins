@@ -6,15 +6,20 @@
 -- after that every keystroke runs `fzf --filter=<query>` over the cache, so
 -- typing stays responsive even on large trees. Results update live; picking
 -- one opens it with the system MIME association (xdg-open) — directories
--- open in the file manager. Enter opens the top match. Right-clicking a row
--- raises a native context menu (plugin_api >= 28) with open, reveal in the
--- file manager, copy path and copy name.
+-- open in the file manager. Up/Down move a selection through the results,
+-- Enter opens it (the top match until moved). Right-clicking a row raises a
+-- native context menu (plugin_api >= 28) with open, reveal in the file
+-- manager, copy path and copy name.
 --
 -- The roots come from the search scope, cycled with the panel's disk button
 -- and persisted in the plugin data directory so the launcher entry follows the
 -- same choice: the search folder alone (default), the search folder plus every
 -- mounted USB/removable volume, or those volumes alone. Mounts are detected
 -- with `lsblk` (see probeMounts), only when the scope needs them.
+--
+-- The globe button swaps the search folder for "/" (whole-system search),
+-- still pruning remote, FUSE and pseudo filesystems and the removable disks
+-- (see shared.wholePrunePaths). Unreadable folders are skipped silently.
 --
 -- The index is rebuilt when the panel opens with changed settings, a different
 -- scope or a different set of disks, and on demand via the refresh button. The
@@ -45,6 +50,20 @@ local shared = require("./shared.luau")
 -- The usage donut under the results. Panel-only, so it is not in shared.luau:
 -- the bar widget and the launcher have no chart to draw.
 local usage = require("./usage.luau")
+
+-- The Space tab's body. Same require() route as above.
+local space = require("./space.luau")
+-- Late-bound: onSearchHere is the global defined further down this file.
+space.onSearchHere = function(path) onSearchHere(path) end
+
+-- Which tab is showing: "search" | "space". Reset to search on every open.
+local activeTab = "search"
+
+-- The Space tab can be turned off in the settings (nil = not set = on). Every
+-- call into `space` below sits behind this.
+local function spaceOn()
+    return noctalia.getConfig("space_enabled") ~= false
+end
 
 -- Read out of the plugin's own manifest (readFile resolves a relative path
 -- against the plugin directory), so the header cannot drift from the version
@@ -81,6 +100,18 @@ local showUsage = true  -- the usage donut, toggled from the header
 -- instead of being fzf syntax to recognise and edit out.
 local usageFilter = nil
 
+-- Keyboard selection: Up/Down move it, Enter opens it. `revealKey` on the
+-- scroll view (plugin_api >= 33) keeps the selected row in view.
+local sel = 1 -- index into `results`
+-- capture_keys filters key repeat (one press, one release), so holding an
+-- arrow is repeated from the frame tick. It stops at the end of the list
+-- instead of wrapping, which also bounds it should a release ever go missing.
+local KEY_STEPS = { up = -1, down = 1 }
+local REPEAT_DELAY_MS = 350
+local REPEAT_STEP_MS = 60
+local heldStep = 0
+local repeatInMs = 0
+
 local render
 local runSearch
 local buildIndex
@@ -102,12 +133,18 @@ local spinnerIndex = 1
 local spinnerAccumMs = 0
 local spinnerTicking = false
 
+-- The frame tick has three users: the spinner, a held arrow key and the
+-- Space tab's scan engine (space.step).
+local function syncFrameTick()
+    panel.setNeedsFrameTick(spinnerTicking or heldStep ~= 0 or (spaceOn() and space.needsTick()))
+end
+
 local function setSpinnerTicking(on)
     if on == spinnerTicking then
         return
     end
     spinnerTicking = on
-    panel.setNeedsFrameTick(on)
+    syncFrameTick()
     if not on then
         spinnerAccumMs = 0
         spinnerIndex = 1
@@ -234,7 +271,7 @@ end
 -- >100 MB, and paying that read on every scope change is what made the button
 -- feel like it wedged the shell.
 local function readTotal(dir)
-    local target = shared.scope
+    local target = shared.cacheTag()
     buildMs = nil -- belongs to the index of this scope, if that one recorded it
     local recorded = noctalia.readFile(dir .. "/count-" .. target)
     if recorded ~= nil then
@@ -265,7 +302,7 @@ local function readTotal(dir)
         if result.exitCode == 0 and not result.timedOut then
             local count = tonumber(shared.trim(result.stdout or "")) or 0
             totals[target] = { count = count, size = info.size, mtime = info.mtime }
-            if shared.scope == target then
+            if shared.cacheTag() == target then
                 total = count
                 render()
             end
@@ -300,7 +337,7 @@ buildIndex = function()
     -- the format of the index being replaced.
     local builtRoots = shared.roots
     local absolute = #builtRoots > 1
-    local builtScope = shared.scope
+    local builtScope = shared.cacheTag()
 
     local cmd = shared.buildCommand(dir, key, absolute)
 
@@ -309,7 +346,7 @@ buildIndex = function()
         indexing = false
         if result.exitCode == 0 and not result.timedOut then
             totals[builtScope] = nil -- size/mtime moved; recount lazily
-            if builtScope ~= shared.scope then
+            if builtScope ~= shared.cacheTag() then
                 -- The scope was cycled while the walk ran, so what just landed
                 -- on disk is not what the panel is showing: none of it — the
                 -- count, the freshness — describes the current scope. Derive
@@ -393,6 +430,7 @@ runSearch = function()
             for line in (result.stdout or ""):gmatch("[^\n]+") do
                 table.insert(results, line)
             end
+            sel = 1
         end
         -- The query moved on while this search ran: chase it. The stale
         -- rows rendered below are overwritten as soon as it completes.
@@ -446,61 +484,14 @@ local function copyName(rel)
     noctalia.notify(shared.tr("title"), shared.tr("copied_name"))
 end
 
--- file:// URI for a local path. Every byte outside the unreserved set is
--- percent-encoded one byte at a time, which is also the correct encoding for
--- the UTF-8 sequences of a non-ASCII name — and it leaves the result free of
--- quotes and spaces, so it can be dropped into a GVariant literal as-is.
-local function fileUri(path)
-    return "file://" .. (path:gsub("[^%w%-%._~/]", function(byte)
-        return string.format("%%%02X", string.byte(byte))
-    end))
-end
-
--- Show the entry in the system file manager: its containing folder opens with
--- the entry itself selected, for a directory too (its parent opens, with the
--- directory highlighted) — left click is what enters a directory.
---
--- ShowItems on the org.freedesktop.FileManager1 interface is the portable way
--- to say "reveal this": Thunar, Nautilus, Dolphin, Nemo, Caja and PCManFM-Qt
--- all implement it, and the session bus activates the handler on demand, so
--- the file manager does not need to be running. When there is no such handler,
--- or no gdbus at all (execvp failing is a 127 exit like any other), the
--- fallback opens the containing folder through the MIME association, which is
--- the same window minus the selection.
---
--- An argv (plugin_api >= 24) rather than a shell line: the GVariant literal
--- carries a file name straight from the index and nothing parses it. That moves
--- the `||` fallback out of the shell and into the callback.
+-- Show the entry in the system file manager (see shared.revealPath).
 local function revealEntry(rel)
     local path = shared.absolutePath(rel)
     if path == nil then
         rejectRecord(rel)
         return
     end
-    local parent = path:match("^(.*)/[^/]+$")
-    if parent == nil or parent == "" then
-        parent = "/"
-    end
-    local ok = noctalia.runAsync({
-        "gdbus",
-        "call",
-        "--session",
-        "--dest",
-        "org.freedesktop.FileManager1",
-        "--object-path",
-        "/org/freedesktop/FileManager1",
-        "--method",
-        "org.freedesktop.FileManager1.ShowItems",
-        '["' .. fileUri(path) .. '"]',
-        "",
-    }, function(result)
-        if result.exitCode ~= 0 or result.timedOut then
-            shared.openPath(parent)
-        end
-    end, 5000)
-    if not ok then
-        shared.openPath(parent)
-    end
+    shared.revealPath(path)
 end
 
 -- The result row's right-click menu (plugin_api >= 28). Only a ui.button's
@@ -540,6 +531,7 @@ local function resultRow(rel, index)
         text = shown,
         variant = "ghost",
         contentAlign = "start",
+        selected = index == sel,
         onClick = function()
             openEntry(rel) -- always the full record, never the elided label
         end,
@@ -604,6 +596,12 @@ end
 
 -- ── usage donut ──────────────────────────────────────────────────────────────
 
+-- The chart measures the search folder, and its legend filters records
+-- relative to it: neither holds on a disk scope or on a whole-system index.
+local function usageAvailable()
+    return shared.scope == "folder" and not shared.whole
+end
+
 local USAGE_SIZE = 108
 local USAGE_THICKNESS = 16
 local USAGE_LABEL_MAX = 16
@@ -616,7 +614,7 @@ local USAGE_ROW_HEIGHT = 20
 -- scope: those roots are removable volumes, du over one is a minutes-long
 -- walk, and the panel already refuses to index them unasked.
 local function requestUsage(force)
-    if not showUsage or shared.scope ~= "folder" then
+    if not showUsage or not usageAvailable() then
         return
     end
     local root = shared.searchRoot()
@@ -709,7 +707,7 @@ end
 -- The whole strip, or nil when it is off — which leaves the panel exactly the
 -- shape it had before the chart existed.
 local function usageSection()
-    if not showUsage or shared.scope ~= "folder" then
+    if not showUsage or not usageAvailable() then
         return nil
     end
 
@@ -900,11 +898,22 @@ local function usageButton()
         key = "usage-toggle",
         glyph = "chart-donut",
         variant = showUsage and "secondary" or "ghost",
-        enabled = shared.scope == "folder",
-        tooltip = shared.scope == "folder"
+        enabled = usageAvailable(),
+        tooltip = usageAvailable()
             and shared.tr(showUsage and "tip_usage_hide" or "tip_usage_show")
             or shared.tr("tip_usage_folder_only"),
         onClick = "onToggleUsage",
+    })
+end
+
+-- Whole-system search on/off. Highlighted while on, like the usage toggle.
+local function wholeButton()
+    return ui.button({
+        key = "whole-toggle",
+        glyph = "world",
+        variant = shared.whole and "secondary" or "ghost",
+        tooltip = shared.tr(shared.whole and "tip_whole_off" or "tip_whole_on"),
+        onClick = "onToggleWhole",
     })
 end
 
@@ -930,42 +939,123 @@ local function scopeButton()
     })
 end
 
+-- Move the selection by `step` rows. A fresh press wraps around the ends; a
+-- repeat does not. Returns whether it moved.
+local function moveSelection(step, wrap)
+    local count = #results
+    if count == 0 then
+        return false
+    end
+    local target = sel + step
+    if target < 1 or target > count then
+        if not wrap then
+            return false
+        end
+        target = target < 1 and count or 1
+    end
+    if target == sel then
+        return false
+    end
+    sel = target
+    return true
+end
+
+local function stopKeyRepeat()
+    heldStep = 0
+    syncFrameTick()
+end
+
+-- Tab bar under the header: Search (this file) and Space (space.luau). The
+-- ids double as node keys ("tab-<id>"), so both stay stable across renders.
+local TABS = { "search", "space" }
+local TAB_GLYPH = { search = "search", space = "chart-pie" }
+
+local function setActiveTab(id)
+    if id == activeTab or (id == "space" and not spaceOn()) then
+        return
+    end
+    activeTab = id
+    stopKeyRepeat()
+    if id == "space" then
+        -- Not on panel open: a Search-only session never starts an ncdu scan.
+        space.onOpen(render)
+    elseif spaceOn() then
+        space.onClose() -- its scan events stop re-rendering this tab
+    end
+    render()
+end
+
+local function tabSelector()
+    local buttons = {}
+    for _, id in ipairs(TABS) do
+        table.insert(buttons, ui.button({
+            key = "tab-" .. id,
+            glyph = TAB_GLYPH[id],
+            text = shared.tr("tab_" .. id),
+            variant = "ghost", controlSize = "sm", flexGrow = 1,
+            selected = (activeTab == id),
+            onClick = function() setActiveTab(id) end,
+        }))
+    end
+    return ui.row({ key = "tabs", gap = 4, align = "center" }, buttons)
+end
+
 render = function()
     setSpinnerTicking(indexing and #results == 0)
+    syncFrameTick() -- also follows space.needsTick(), which changes outside this file
+    -- Clamped here, so a list that shrank or emptied needs no call of its own.
+    sel = math.max(1, math.min(sel, #results))
 
     -- Every child of the panel and of the header carries a stable key, so the
     -- reconciler matches roles instead of guessing by position and type.
-    local children = {
-        ui.row({ key = "header", gap = 6, align = "center" }, {
-            ui.label({
-                key = "title",
-                text = shared.tr("title"),
-                fontSize = 16,
-                fontWeight = "bold",
-                color = "on_surface",
-            }),
-            -- Version off the manifest, small and dimmed: it answers "which
-            -- build am I running" without competing with the title. The spacer
-            -- rather than a flexGrow title keeps the two together on the left.
-            ui.label({ key = "version", text = pluginVersion, fontSize = 10, color = "on_surface_variant" }),
-            ui.spacer({ key = "gap", flexGrow = 1 }),
-            rankingButton(),
-            usageButton(),
-            scopeButton(),
-            ui.button({ key = "refresh", glyph = "refresh", variant = "ghost", tooltip = shared.tr("tip_refresh"), onClick = "onRefreshIndex" }),
-            ui.button({ key = "settings", glyph = "settings", variant = "ghost", tooltip = shared.tr("tip_settings"), onClick = "onOpenSettings" }),
-            ui.button({ key = "close", glyph = "close", variant = "ghost", tooltip = shared.tr("tip_close"), onClick = "onClosePanel" }),
+    local headerItems = {
+        ui.label({
+            key = "title",
+            text = shared.tr("title"),
+            fontSize = 16,
+            fontWeight = "bold",
+            color = "on_surface",
         }),
+        -- Version off the manifest, small and dimmed: it answers "which
+        -- build am I running" without competing with the title. The spacer
+        -- rather than a flexGrow title keeps the two together on the left.
+        ui.label({ key = "version", text = pluginVersion, fontSize = 10, color = "on_surface_variant" }),
+        ui.spacer({ key = "gap", flexGrow = 1 }),
+    }
+    -- Search-only buttons; the Space tab has its own row.
+    if activeTab == "search" then
+        table.insert(headerItems, rankingButton())
+        table.insert(headerItems, usageButton())
+        table.insert(headerItems, wholeButton())
+        table.insert(headerItems, scopeButton())
+        table.insert(headerItems, ui.button({ key = "refresh", glyph = "refresh", variant = "ghost", tooltip = shared.tr("tip_refresh"), onClick = "onRefreshIndex" }))
+    end
+    table.insert(headerItems, ui.button({ key = "settings", glyph = "settings", variant = "ghost", tooltip = shared.tr("tip_settings"), onClick = "onOpenSettings" }))
+    table.insert(headerItems, ui.button({ key = "close", glyph = "close", variant = "ghost", tooltip = shared.tr("tip_close"), onClick = "onClosePanel" }))
+    local header = ui.row({ key = "header", gap = 6, align = "center" }, headerItems)
+
+    if activeTab == "space" and spaceOn() then
+        panel.render(ui.column({ flexGrow = 1, gap = 12, align = "stretch" }, {
+            header, tabSelector(), space.render(),
+        }))
+        return
+    end
+
+    local children = {
+        header,
         ui.input({
             key = "query-" .. inputRev,
             value = query,
             focus = true,
             placeholder = shared.tr("search_placeholder"),
             onChange = "onQueryChanged",
-            onSubmit = "onOpenFirst",
+            onSubmit = "onOpenSelected",
         }),
         syntaxLegend(),
     }
+    if spaceOn() then
+        table.insert(children, 2, tabSelector())
+    end
 
     local strip = usageFilterStrip()
     if strip ~= nil then
@@ -1006,7 +1096,7 @@ render = function()
         for index, rel in ipairs(results) do
             table.insert(rows, resultRow(rel, index))
         end
-        body = ui.scroll({ key = "hits", flexGrow = 1, gap = 2 }, rows)
+        body = ui.scroll({ key = "hits", flexGrow = 1, gap = 2, revealKey = "hit-" .. sel }, rows)
     end
     table.insert(children, ui.column({ key = "body", flexGrow = 1, align = "stretch" }, { body }))
     -- Below the results: the chart describes the folder, not the query.
@@ -1050,7 +1140,7 @@ applyState = function()
         -- Out of date, and not ours to fix on our own: an index built for
         -- another disk set still answers most queries, so it is searched and
         -- labelled rather than thrown away.
-        haveIndex = noctalia.fileExists(dir .. "/list-" .. shared.scope)
+        haveIndex = noctalia.fileExists(dir .. "/list-" .. shared.cacheTag())
         indexState = haveIndex and "stale" or "missing"
         if haveIndex then
             readTotal(dir)
@@ -1111,6 +1201,7 @@ end
 
 function onOpen(_context)
     fzfMissing = not noctalia.commandExists("fzf")
+    activeTab = "search"
     query = ""
     results = {}
     errMsg = nil
@@ -1121,6 +1212,7 @@ function onOpen(_context)
     -- launcher can cycle it), so nothing is searched until reload() has
     -- checked the fingerprint of the cache this scope actually uses.
     haveIndex = false
+    sel = 1
     inputRev += 1
     noctalia.state.set("file_search_open", true)
     local dir = shared.dataDir()
@@ -1128,6 +1220,7 @@ function onOpen(_context)
         -- Re-read on every open: the launcher may have cycled the scope, and
         -- a script reload drops both of these from memory.
         shared.scope = shared.readScope(dir)
+        shared.whole = shared.readWhole(dir)
         shared.ranking = shared.readRanking(dir)
         showUsage = readShowUsage(dir)
         -- An earlier session's measurement, so the chart is up with the panel
@@ -1155,13 +1248,35 @@ function onClose()
     -- Stop the frame tick even mid-build; the next onOpen re-arms it if the
     -- build is somehow still running (buildIndex survives the panel closing).
     setSpinnerTicking(false)
+    stopKeyRepeat() -- a key held while the panel closes never reports its release
     noctalia.state.set("file_search_open", false)
+    if spaceOn() then
+        space.onClose()
+    end
+    panel.setNeedsFrameTick(false) -- a running scan resumes on the next open
 end
 
 -- plugin_api >= 18. Throttled to SPINNER_STEP_MS regardless of the host's
 -- actual tick rate; render() itself flips setNeedsFrameTick off once indexing
 -- ends or results stop being empty, so this never spins forever unattended.
 function onFrameTick(deltaMs)
+    -- The tick follows needsTick() after every step: a step can end a load
+    -- (whose redraw turns the tick off) and then start the deferred rescan.
+    if spaceOn() and space.needsTick() then
+        space.step()
+        syncFrameTick()
+    end
+    if heldStep ~= 0 then
+        repeatInMs -= deltaMs
+        if repeatInMs <= 0 then
+            repeatInMs = REPEAT_STEP_MS
+            if moveSelection(heldStep, false) then
+                render()
+            else
+                stopKeyRepeat()
+            end
+        end
+    end
     if not spinnerTicking then
         return
     end
@@ -1175,6 +1290,17 @@ function onFrameTick(deltaMs)
 end
 
 function onConfigChanged()
+    if spaceOn() then
+        space.onConfigChanged() -- before the Search side's early return
+    elseif activeTab == "space" then
+        activeTab = "search"
+        space.onClose()
+        space.onDisabled()
+        stopKeyRepeat()
+        render()
+    else
+        space.onDisabled() -- a scan left running by a closed panel
+    end
     if fzfMissing or indexing then
         return
     end
@@ -1185,6 +1311,7 @@ function onConfigChanged()
     local dir = shared.dataDir()
     if dir ~= nil then
         shared.scope = shared.readScope(dir)
+        shared.whole = shared.readWhole(dir)
     end
     -- Expired, not redone: this also fires with the panel closed. A changed
     -- search_folder invalidates itself (usage.fresh compares the root); a
@@ -1198,10 +1325,33 @@ function onQueryChanged(value)
     runSearch()
 end
 
-function onOpenFirst(value)
+-- Enter in the query input: opens the selected row, which is the top match
+-- until an arrow key has moved it.
+function onOpenSelected(value)
     query = value
-    if results[1] ~= nil then
-        openEntry(results[1])
+    if results[sel] ~= nil then
+        openEntry(results[sel])
+    end
+end
+
+-- The chords listed under capture_keys in plugin.toml. They arrive here even
+-- while the query input has focus; typing still goes to the input.
+function onKey(chord, pressed)
+    local step = KEY_STEPS[chord]
+    if step == nil or (activeTab == "space" and spaceOn()) then
+        return
+    end
+    if not pressed then
+        if heldStep == step then
+            stopKeyRepeat()
+        end
+        return
+    end
+    heldStep = step
+    repeatInMs = REPEAT_DELAY_MS
+    syncFrameTick()
+    if moveSelection(step, true) then
+        render()
     end
 end
 
@@ -1219,6 +1369,40 @@ function onRefreshIndex()
     requestUsage(true)
 end
 
+-- The Space tab's "search here" button. Records are relative to the single
+-- search root, so a folder below it is just a longer prefix for folderToken
+-- ("^a/b/"); the root itself means no restriction. Anything else (another
+-- root, the home when the search folder is elsewhere, several roots) cannot
+-- be expressed, so it is a notice and the tab stays. So is a path with a
+-- control character (it comes from a disk name).
+function onSearchHere(path)
+    if not spaceOn() then
+        return
+    end
+    local root = shared.roots[1]
+    -- Only the folder scope on the search folder has records relative to one
+    -- root (the only place the restriction strip and chart exist).
+    if shared.scope ~= "folder" or shared.whole or #shared.roots ~= 1 or root == nil or path:find("%c") then
+        noctalia.notify(shared.tr("title"), shared.tr("space_search_unavailable"))
+        return
+    end
+    local prefix = root == "/" and "/" or root .. "/"
+    local rel = nil
+    if path == root then
+        rel = ""
+    elseif shared.startsWith(path, prefix) then
+        rel = path:sub(#prefix + 1)
+    end
+    if rel == nil then
+        noctalia.notify(shared.tr("title"), shared.tr("space_search_outside"))
+        return
+    end
+    usageFilter = rel ~= "" and rel or nil
+    setActiveTab("search")
+    render()
+    runSearch()
+end
+
 -- The strip's ✕. Same effect as re-clicking the highlighted legend row, offered
 -- where the restriction is shown: the chart can be switched off while it is on.
 function onClearUsageFilter()
@@ -1232,7 +1416,7 @@ end
 
 -- Hiding does not discard the measurement, so showing it again is instant.
 function onToggleUsage()
-    if shared.scope ~= "folder" then
+    if not usageAvailable() then
         return
     end
     showUsage = not showUsage
@@ -1285,6 +1469,25 @@ function onCycleScope()
     requestUsage(false)
 end
 
+-- Same shape as onCycleScope: persist, clear, and let requestReload decide
+-- whether the other index is fresh or needs a walk. Each side keeps its own
+-- cache (shared.cacheTag), so toggling back is instant.
+function onToggleWhole()
+    shared.whole = not shared.whole
+    local dir = shared.dataDir()
+    if dir ~= nil then
+        shared.writeWhole(dir, shared.whole)
+    end
+    shared.mountsAt = 0 -- the folder scope never took a mount list
+    results = {}
+    total = nil
+    errMsg = nil
+    usageFilter = nil
+    render()
+    requestReload(false, false)
+    requestUsage(false)
+end
+
 -- Dispatch for a result row's context menu. `action` is the id of the entry
 -- picked, `context` the index record the menu was opened on.
 function onResultMenu(action, context)
@@ -1300,6 +1503,14 @@ function onResultMenu(action, context)
     elseif action == "copy_name" then
         copyName(context)
     end
+end
+
+-- Global because openContextMenu names its handler; the logic lives in space.luau.
+function onSpaceMenu(action, context)
+    if not spaceOn() then
+        return
+    end
+    space.menuAction(action, context)
 end
 
 -- Opens the settings window on this plugin's own page (the host supplies the

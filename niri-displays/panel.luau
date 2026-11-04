@@ -29,6 +29,7 @@ local actionError = ""
 local scaleDraft = {}
 local scaleEditing = {}
 local positionDraft = {}
+local lastEnabledByPort = {}
 local layoutExpanded = false
 local selectedPort = nil
 local layoutDirection = nil
@@ -47,6 +48,14 @@ local function syncFromState()
   local presentPorts = {}
   for _, display in ipairs(snapshot.displays) do
     presentPorts[display.port] = true
+    -- A re-enabled output keeps the placeholder 0,0 geometry it reported while
+    -- disabled. Drop its drafts so they reseed from the values Niri just picked.
+    if display.enabled and lastEnabledByPort[display.port] == false then
+      scaleDraft[display.port] = nil
+      scaleEditing[display.port] = nil
+      positionDraft[display.port] = nil
+    end
+    lastEnabledByPort[display.port] = display.enabled
     if scaleDraft[display.port] == nil or (not actionPending and not scaleEditing[display.port]) then
       scaleDraft[display.port] = display.scale
     end
@@ -62,6 +71,7 @@ local function syncFromState()
       scaleDraft[port] = nil
       scaleEditing[port] = nil
       positionDraft[port] = nil
+      lastEnabledByPort[port] = nil
     end
   end
 end
@@ -257,6 +267,24 @@ local function changeTransform(display, index)
   end
   local command = "niri msg output " .. quoteShellArgument(display.port)
     .. " transform " .. quoteShellArgument(choice.value)
+  runNiri(command)
+end
+
+local function enabledCount()
+  local count = 0
+  for _, display in ipairs(snapshot.displays) do
+    if display.enabled then
+      count += 1
+    end
+  end
+  return count
+end
+
+-- `niri msg output <port> on|off` is temporary like every other command here:
+-- the compositor config still decides the state after a reload.
+local function changeEnabled(display, on)
+  local command = "niri msg output " .. quoteShellArgument(display.port)
+    .. (on and " on" or " off")
   runNiri(command)
 end
 
@@ -524,8 +552,8 @@ local function layoutSection(displays)
   end
 
   local header = ui.column({
-    fill = "surface_variant/0.18",
-    border = "outline/0.42",
+    fill = "surface_container/0.18",
+    border = "outline_variant/0.42",
     borderWidth = 1,
     radius = 12,
     align = "stretch",
@@ -552,8 +580,8 @@ local function layoutSection(displays)
 
   if map ~= nil then
     table.insert(children, ui.column({
-      fill = "surface_variant/0.18",
-      border = "outline/0.34",
+      fill = "surface_container/0.18",
+      border = "outline_variant/0.34",
       borderWidth = 1,
       radius = 10,
       padding = 10,
@@ -672,8 +700,8 @@ local function layoutSection(displays)
     ui.column({
       gap = 10,
       align = "stretch",
-      fill = "surface_variant/0.18",
-      border = "outline/0.34",
+      fill = "surface_container/0.18",
+      border = "outline_variant/0.34",
       borderWidth = 1,
       radius = 10,
       padding = 10,
@@ -702,7 +730,7 @@ local function scaleMarkers(scale)
       ui.label({
         text = "┆",
         fontSize = 12,
-        color = active and "primary" or "outline",
+        color = active and "primary" or "outline_variant",
       }),
       ui.label({
         text = formatScale(value) .. "×",
@@ -729,6 +757,8 @@ local function displayCard(display, position)
   local refreshOptions = optionsFromChoices(refreshes)
   local transformOptions = optionsFromChoices(TRANSFORM_OPTIONS)
   local enabled = display.enabled and not actionPending and #resolutions > 0
+  -- Refuse to black out the session: the final lit output cannot be switched off.
+  local isLastEnabled = display.enabled and enabledCount() <= 1
   local presetScale = presetFor(display.port, display.width, display.height)
   local scale = scaleDraft[display.port] or display.scale
   local minScale = 0.5
@@ -750,6 +780,20 @@ local function displayCard(display, position)
   end
 
   local body = {
+    ui.row({ align = "center", justify = "space_between" }, {
+      ui.label({
+        text = tr(isLastEnabled and "panel.last_display" or "panel.enabled"),
+        fontSize = 11,
+        color = "on_surface_variant",
+      }),
+      ui.toggle({
+        checked = display.enabled,
+        enabled = not actionPending and not isLastEnabled,
+        onChange = function(value)
+          changeEnabled(display, value == "true")
+        end,
+      }),
+    }),
     field(tr("panel.resolution"), ui.select({
       options = resolutionOptions,
       selectedIndex = selectedResolutionIndex(display, resolutions),
@@ -812,8 +856,8 @@ local function displayCard(display, position)
 
   return ui.column({
     key = "display:" .. display.port,
-    fill = display.focused and "primary/0.055" or "surface_variant/0.18",
-    border = display.focused and "primary/0.75" or "outline/0.42",
+    fill = display.focused and "primary/0.055" or "surface_container/0.18",
+    border = display.focused and "primary/0.75" or "outline_variant/0.42",
     borderWidth = display.focused and 2 or 1,
     radius = 12,
     padding = 10,
@@ -924,8 +968,8 @@ render = function()
     align = "center",
     paddingH = 10,
     paddingV = 4,
-    fill = "surface_variant/0.18",
-    border = "outline/0.34",
+    fill = "surface_container/0.18",
+    border = "outline_variant/0.34",
     borderWidth = 1,
     radius = 10,
   }, {

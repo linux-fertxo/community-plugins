@@ -4,6 +4,194 @@ All notable changes to **Media Lyrics** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.8] — 2026-10-13
+
+A **desktop widget** — the now-playing view as a tile pinned to the desktop and shown on
+the lockscreen, independent of any panel — an **audio-reactive bar chip**, and tooltips.
+
+### Added
+
+- **Desktop widget** (`[[desktop_widget]] id = "desktop"`) — the same now-playing /
+  lyrics view as a background layer-shell tile: album cover, title, artist, the lyric
+  window and the transport controls, pinned to the desktop and visible on the lockscreen.
+  A *persistent* panel still disappears once no panel surface is up; a desktop widget
+  does not, which is what "pin it to the desktop" actually needed. Long lyric lines wrap
+  inside the tile, the lyric band keeps a constant height whatever the track does, and
+  the tile is borderless by default, like the built-in desktop widgets. Settings:
+  `lines`, `width`, `height`, `padding`, `background`, `show_artist`, `show_cover`.
+  Available at `plugin_api 20`, so no API bump was needed.
+- **Audio-reactive chip** — the bar-widget settings `audio_spectrum` and
+  `audio_spectrum_bands` make the chip draw a live band meter fed by the host from the
+  PipeWire monitor. Off by default; 1–64 bands, the bars thinning to 1 px above 16 so a
+  high count still fits in the chip.
+- **Tooltips** on the transport controls and on the lyric rows, where a row shows the
+  timestamp it seeks to.
+- **A written report** of the Noctalia 5.2 capability work — `docs/reports/noctalia-52-report.html` —
+  with the measurements, diagrams and screenshots behind the desktop widget, the chip and
+  the tooltips, and what the host does and does not allow.
+
+### Changed
+
+- **`lines` on the desktop widget is a minimum, not a cap.** The band reserves the worst
+  case for that many rows and fills whatever is left with more lyrics, so a track whose
+  lines do not wrap shows more of them instead of leaving a gap above the transport.
+
+## [0.9.7] — 2026-10-02
+
+A seekable progress bar, a pinned mini panel, and two display fixes: the seek
+no longer freezes after a rewind, and the lyric block no longer runs onto the
+bottom edge of the panel.
+
+### Added
+
+- **Seekable progress bar** — the progress line under the artwork is now a real
+  `ui.slider` (the same control the shell's own control-center media tab uses),
+  so you can click anywhere on it to jump and drag to scrub. It spans the full
+  inner width and reuses the existing `seekTo` transport, so lyric-line clicks
+  and the keyboard cursor keep working through the same path. Replaces the
+  display-only `ui.progress`: the host hands a plugin no click coordinates, and
+  `ui.progress` takes no input, so a slider is the only canonical way to make
+  the bar seekable. Thanks to @klntsky, whose seek-bar contribution pointed at
+  the same missing capability.
+- **Mini panel is now pinned** — `panel-mini` declares `persistent = true`, so
+  the always-on karaoke chip survives opening another panel (the control centre,
+  the launcher, …). Previously a normal panel was dismissed the moment any other
+  panel opened, which made the "pin to desktop" placement unusable.
+
+### Changed
+
+- **Visible lyric lines: 9 / 12 / 16** (compact / medium / large) — down from
+  10 / 14 / 16. The row budget is no longer a hardcoded count but is derived from
+  the measured lyrics area and the real row pitch (29 px), so it can never
+  overshoot the panel. Medium drops from 14 to 12 rows; the area simply does not
+  fit 14.
+
+### Fixed
+
+- **The progress bar froze after a rewind** — after seeking (by dragging the bar
+  or by clicking a lyric line) the bar could stay pinned to the target for the
+  rest of the track. The pending-target hold tested "the player has NOT arrived
+  yet?" first, so once playback ran *past* the target that condition became true
+  again and the bar kept drawing the target; the branch that was supposed to
+  release it also required the age timeout at the same instant, so it never ran.
+  The hold now clears as soon as the player reaches the target (and still times
+  out after 15 s if the seek is refused), and all three seek routes go through
+  one entry point.
+
+- **The last lyric line climbed onto the panel's bottom edge** — both the row
+  budget and the empty slot heights were computed from a stale `fs × 1.25`
+  estimate (27 px) while a rendered row measures 29 px, so a full block overshot
+  the lyrics area by ~50 px and clipped. Every row height now comes from one
+  measured pitch constant, and the countdown slot box uses it too.
+
+## [0.9.6] — 2026-10-02
+
+A layout pass over the header, lyric wrapping and the mini panel, plus the
+karaoke centering feature and the lyrics-offset repair.
+
+### Added
+
+- **Karaoke centering + 3-2-1 countdown** - the active lyric line is pinned to
+  the vertical centre of the lyrics area and the window is symmetric around it
+  (the cursor while the user scrolls, otherwise the playing line): the first
+  line starts centred on load, the anchor stays on the centre line through the
+  track, and the last line returns to the centre at the end instead of sticking
+  to the bottom edge. A 3-2-1 countdown is drawn in the free space above the
+  centred first line, shown only in the last three seconds before it starts
+  (never from the top of the track); a track whose first line begins within
+  three seconds just starts at its real digit. Nothing is highlighted before
+  the first line starts. Compact / medium / large only - panel-mini untouched.
+
+### Fixed
+
+- **Lyrics offset setting was inert and sign-inverted** - declared without
+  min/max the host fell back to a 0..100 slider (a tenth of a second, no
+  negative values), and `parseLrc` ADDED the offset while the description
+  promises "positive shows lines earlier". Now `min = -2000` / `max = 2000`
+  and the offset is SUBTRACTED, so positive shows lines earlier and negative
+  later, matching the label.
+
+- **Header: title now fills the whole slot width** - the marquee window was
+  measured with a flat 0.72 em/char estimate, which over-runs mixed-case titles
+  by ~30%, and the capacity also subtracted 26 px of button inner padding that
+  `ui.label` does not have. A title therefore stopped ~90 px short of the
+  transport block (only 132 px of a 224 px slot used). The window now uses the
+  same measured per-glyph advance table as the lyric wrapper.
+- **Header: uniform gaps and one cover size** - the info column was a fixed
+  slot with a `flexGrow` spring beside it, so a truncated title sat next to
+  ~127 px of dead space; gaps differed per preset (8/12/14) and compact ran a
+  36 px cover while medium/large ran 50/56. The gaps are now a uniform 12 px and
+  the cover is 50 px in every preset. The title/artist lines render as
+  `ui.label` with `textAlign = "start"` (a stretched button centred its caption;
+  `contentAlign` had no effect in a panel).
+- **Lyric wrapping uses the real preset width and font metrics** - the compact
+  panel wrapped long lines early: `LYR_WIDTH` was ~36 px under the measured
+  surface width and the glyph table came from the fallback font, not Noto Sans
+  (the actual UI font), overestimating mixed text by 5-6%. Widths are now
+  440 / 520 / 640 and the advances are read from the font file, with the
+  measured bold/medium bumps (1.062 / 1.023).
+- **Wrap safety gutter** - a line whose advance width landed exactly on the
+  content width rendered its last glyph flush against the panel border. The wrap
+  budget now keeps a 24 px gutter (`WRAP_GUTTER`), so a flush-fitting line
+  breaks where it should.
+- **Mini panel** - a long lyric line ran past the panel edge (the label had no
+  width bound); it now carries an explicit `maxWidth` so the host soft-wraps
+  into the reserved second row, plus a 12 px gutter so the last glyph is not
+  flush, and uniform margins (the root row added 8 px on top of the ~13 px host
+  inset, so the text column now adds no padding of its own).
+- **Hover highlight no longer lingers** - the background tint stayed behind
+  after the pointer left a row. The hover cue is now a text colour/opacity
+  shift only, which clears reliably and matches the active-line treatment.
+
+## [0.9.5] — 2026-10-01
+
+### Fixed
+
+- **Album art from online players (Spotify, web players) now renders** — the
+  MPRIS `art_url` may be an HTTP(S) URL rather than a local file, and
+  `ui.image` renders local files only, so the panel drew an empty cover box.
+  Remote artwork is now fetched into the plugin data directory (alternating
+  `cover-0` / `cover-1` slots to dodge a stale read, memoised per URL, with an
+  in-flight guard so a track change cancels a pending download). Local
+  `file://` artwork is unaffected. Fixes #705.
+
+## [0.9.4] — 2026-09-09
+
+### Fixed
+
+- **panel-mini: the cover no longer shifts down when the lyric line wraps** —
+  the mini panel reserved no vertical space for the second lyric sub-line, so
+  a wrapping line grew the info column and the root row's vertical centering
+  moved the cover between renders. The lyric row now holds a fixed
+  two-sub-line height, keeping the whole band layout constant.
+
+### Added
+
+- **Lyrics variants picker (switch on the fly)** — the header "list" button is
+  now always visible while a track is loaded (previously it only appeared when
+  the automatic chain ended with several tied LRCLIB search candidates, i.e.
+  never for tracks whose lyrics loaded normally). Clicking it asks the service
+  to fetch the full LRCLIB search result list on demand (`openLyricChoices`);
+  the currently playing lyrics are never interrupted while the list loads.
+  The selector shows a "Default (provider)" row — restoring the automatic
+  chain result — plus deduplicated candidates (title — artist (album)), with
+  the active variant marked. The list is kept in the snapshot after a pick,
+  so variants can be switched again at any time without re-fetching. Picking
+  a variant applies it through the same accept/cache path as the chain and
+  survives the 150 ms poll (same track-key claim).
+- Also accepts the fixed status contract: a `choose` snapshot with lyrics
+  loaded (picker closed or a picked variant live) renders the karaoke/plain
+  lyrics and the footer provider label instead of a false "No lyrics found".
+
+### Fixed
+
+- **`chooseLyrics` request crashed in the host** — the handler called
+  `acceptAndCache`, a closure private to `loadLyricsForTrack` (nil at module
+  scope), so applying a picked candidate would error. Variant application now
+  uses the file-level `acceptLyrics` + `cacheLyrics` with the current track key.
+- The bar-widget "current lyric line" chip now keeps working while the variant
+  picker is open (`lyricsStatus == "choose"` with live lyrics is accepted).
+
 ## [0.9.3] — 2026-09-06
 
 ### Changed
@@ -11,12 +199,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **plugin_api 24 → 30** — the plugin now declares the full Noctalia 5.0.1
   plugin API (context menus, graph pointer tracking, panel layer). Requires
   Noctalia 5.0.1+.
-- **Overlay layer above fullscreen content** — on Noctalia 5.0.1 the host
-  injects a per-entry **Layer** setting (Settings → Plugins) for every panel:
-  choose `overlay` on any preset (`panel`, `panel-compact`, `panel-large`) so
-  the lyrics window floats above fullscreen video (karaoke over a film /
-  YouTube). (This store copy does not declare `layer` in the manifest — the
-  store validator does not know the field yet; the canonical repo ships it.)
+- **Lyrics panel floats above fullscreen content** — all three panel presets
+  (`panel`, `panel-compact`, `panel-large`) declare `layer = "overlay"`, so
+  the lyrics window stays visible over fullscreen video (karaoke over a
+  film/YouTube). A per-entry **Layer** dropdown in Settings → Plugins can
+  switch any preset back to `top` without editing the manifest.
 
 ## [0.9.2] — 2026-09-06
 

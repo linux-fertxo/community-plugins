@@ -7,7 +7,9 @@ local scanCounter = 0
 local building = false
 local initOk = true
 local selectedIndex = 0
-local WINDOW_SIZE = 4
+
+local COVER_W = 56
+local COVER_H = 80
 
 local steamCoverDir = ""
 local heroicCoverDir = ""
@@ -110,6 +112,24 @@ local function filterGames(text)
     end
   end
   filtered = result
+end
+
+local function clampNum(v, lo, hi)
+  if v < lo then return lo end
+  if v > hi then return hi end
+  return v
+end
+
+-- Key of the selected row; the scroll container reveals it on keyboard moves.
+local function selRowKey()
+  if #filtered == 0 or selectedIndex < 0 or selectedIndex >= #filtered then return nil end
+  return filtered[selectedIndex + 1].id .. "_" .. (selectedIndex + 1)
+end
+
+local function launchSelected()
+  if #filtered > 0 and selectedIndex >= 0 and selectedIndex < #filtered then
+    launchGame(filtered[selectedIndex + 1].id)
+  end
 end
 
 local function isImageFile(path)
@@ -235,21 +255,12 @@ local runnerMeta = {
   heroic = { glyph = "app-window", color = "#a78bfa" },
 }
 
-local function renderHeader()
-  return ui.row({ align = "center", gap = 8 }, {
-    ui.glyph({ name = "device-gamepad-2", size = 20, color = "primary" }),
-    ui.label({ text = "Game Launcher", fontSize = 18, fontWeight = "bold", color = "primary", flexGrow = 1 }),
-    ui.label({ text = "(" .. #games .. " games)", color = "on_surface_variant", fontSize = 12 }),
-    ui.button({ glyph = "reload", variant = "ghost", onClick = "onRescan" }),
-    ui.button({ glyph = "close", variant = "ghost", onClick = "onClose" }),
-  })
-end
+local CONTROL_H = 32
 
 local function renderSearchBar()
   return ui.row({ align = "center", gap = 8 }, {
-    ui.glyph({ name = "search", size = 14, color = "on_surface_variant" }),
-    ui.input({ key = "search_" .. scanCounter, placeholder = "Search games…", onChange = "onSearch", value = searchText, flexGrow = 1, focus = true }),
-    ui.button({ glyph = "filter", variant = "ghost", visible = false }),
+    ui.input({ key = "search_" .. scanCounter, placeholder = "Search games…", onChange = "onSearch", onSubmit = "onSubmitSearch", value = searchText, flexGrow = 1, height = CONTROL_H, focus = true }),
+    ui.button({ glyph = "reload", variant = "ghost", onClick = "onRescan", tooltip = "Rescan", width = CONTROL_H, height = CONTROL_H }),
   })
 end
 
@@ -290,9 +301,9 @@ local function renderGameRow(g, index)
   end
   local coverWidget
   if cp and noctalia.fileExists(cp) then
-    coverWidget = ui.image({ path = cp, width = 56, height = 80, radius = 6, fit = "cover" })
+    coverWidget = ui.image({ path = cp, width = COVER_W, height = COVER_H, radius = 8, fit = "cover" })
   else
-    coverWidget = ui.box({ width = 56, height = 80, radius = 6, fill = "surface_variant" })
+    coverWidget = ui.box({ width = COVER_W, height = COVER_H, radius = 8, fill = "surface_container" })
   end
   local children = {
     coverWidget,
@@ -311,37 +322,22 @@ local function renderGameRow(g, index)
     }),
   }
   if isSelected then
-    table.insert(children, 1, ui.box({ width = 2, height = 60, radius = 1, fill = "primary" }))
-    return ui.row({
-      key = g.id .. "_sel_" .. index,
-      align = "center",
-      gap = 14,
-      paddingH = 12,
-      paddingV = 8,
-      radius = 8,
-    }, children)
+    table.insert(children, 1, ui.box({ width = 2, height = COVER_H - 8, radius = 1, fill = "primary" }))
   end
+  local gap, padH, padV = 8, 4, 4
   return ui.row({
     key = g.id .. "_" .. index,
     align = "center",
-    gap = 14,
-    paddingH = 12,
-    paddingV = 8,
+    gap = gap,
+    paddingH = padH,
+    paddingV = padV,
     radius = 8,
   }, children)
 end
 
 local function renderGameList()
   local rows = {}
-  local total = #filtered
-  if total == 0 then return rows end
-  local half = math.floor(WINDOW_SIZE / 2)
-  local start = math.max(1, selectedIndex + 1 - half)
-  if start + WINDOW_SIZE > total then
-    start = math.max(1, total - WINDOW_SIZE + 1)
-  end
-  local endIdx = math.min(total, start + WINDOW_SIZE - 1)
-  for i = start, endIdx do
+  for i = 1, #filtered do
     table.insert(rows, renderGameRow(filtered[i], i))
   end
   return rows
@@ -367,20 +363,39 @@ local function renderBody(content)
   return content
 end
 
+local computeLayout
+
 local function render()
   local ok, err = pcall(function()
-    panel.render(ui.column({ flexGrow = 1, gap = 8, padding = 12 }, {
-      ui.column({ gap = 8 }, {
-        renderHeader(),
+    -- Router guard: in original mode this entry must never stay open.
+    -- onOpen hands off to the original panel, this catches any desync.
+    local okm, modem = pcall(noctalia.getConfig, "panel_mode")
+    if okm and modem == "original" then
+      panel.close()
+      return
+    end
+    computeLayout()
+    local body = renderBody(renderGameList())
+    local bodyWidget
+    if loading or errorMsg ~= "" or #filtered == 0 then
+      bodyWidget = ui.column({ flexGrow = 1, gap = 6, padding = 8 }, body)
+    else
+      bodyWidget = ui.scroll({ flexGrow = 1, gap = 8, paddingH = 4, paddingV = 2, revealKey = selRowKey() }, body)
+    end
+    panel.render(ui.column({ flexGrow = 1, gap = 0, align = "stretch" }, {
+      ui.column({ gap = 8, paddingH = 8, paddingV = 8 }, {
         renderSearchBar(),
       }),
-      ui.column({ flexGrow = 1, gap = 6 }, renderBody(renderGameList())),
+      ui.separator({ thickness = 1, color = "surface_container" }),
+      bodyWidget,
     }))
   end)
   if not ok then
     noctalia.log("render error: " .. tostring(err))
   end
 end
+
+local scanGames
 
 local function buildBinary()
   if building then return end
@@ -410,7 +425,7 @@ local function buildBinary()
   end
 end
 
-local function scanGames()
+function scanGames()
   if loading or building then return end
   if not binaryReady() then
     buildBinary()
@@ -467,7 +482,52 @@ local function scanGames()
 end
 
 
+local function outputLogicalHeight()
+  local ok, outs = pcall(noctalia.outputs)
+  if not (ok and type(outs) == "table" and #outs > 0) then return nil end
+  local target = outs[1]
+  local okf, focused = pcall(noctalia.focusedOutputName)
+  if okf and focused then
+    for _, o in ipairs(outs) do
+      if type(o) == "table" and o.name == focused then
+        target = o
+        break
+      end
+    end
+  end
+  if type(target) ~= "table" or type(target.height) ~= "number" then return nil end
+  local scale = (type(target.scale) == "number" and target.scale > 0) and target.scale or 1
+  return target.height / scale
+end
+
+function computeLayout()
+  COVER_W, COVER_H = 56, 80
+  local h = outputLogicalHeight()
+  if h then
+    local covH = clampNum(math.floor((h - 190) / 8 - 14), 48, 160) + 4.5
+    COVER_H = covH
+    COVER_W = math.floor(covH * 0.7)
+  end
+end
+
 function onOpen(context)
+  -- Single-command routing: the keybind always toggles the sidebar panel.
+  -- The host shows one panel at a time, so opening sidebar already
+  -- closed :original when it was open. The flag tells whether this
+  -- press must reopen it (was closed) or stay closed (was open).
+  local ok, mode = pcall(noctalia.getConfig, "panel_mode")
+  if ok and mode == "original" then
+    if noctalia.state.get("o_open") == true then
+      noctalia.state.set("o_open", false)
+      panel.close()
+      return
+    end
+    panel.close()
+    noctalia.togglePanel("alexander/game-launcher:original")
+    return
+  end
+  noctalia.state.set("o_open", false)
+  computeLayout()
   selectedIndex = 0
   filterGames(searchText)
   render()
@@ -504,8 +564,10 @@ function onKey(chord, pressed)
       render()
     end
   elseif chord == "Return" then
-    if #filtered > 0 and selectedIndex >= 0 and selectedIndex < #filtered then
-      launchGame(filtered[selectedIndex + 1].id)
-    end
+    launchSelected()
   end
+end
+
+function onSubmitSearch()
+  launchSelected()
 end

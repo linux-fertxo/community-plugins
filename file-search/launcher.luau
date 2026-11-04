@@ -46,7 +46,7 @@ local function scopeRow()
 end
 
 -- Activating this is what authorises a walk. It is always offered on an empty
--- query, and pushed to the top when the index for a disk scope is missing or
+-- query (above the results), and pushed to the top when the index for a disk scope is missing or
 -- out of date, since nothing else will rebuild it.
 local function reindexRow()
     return {
@@ -80,7 +80,7 @@ local function buildIndex(query)
     -- The format this walk writes follows the roots it is about to visit.
     local builtRoots = shared.roots
     local absolute = #builtRoots > 1
-    local builtScope = shared.scope
+    local builtScope = shared.cacheTag()
     -- The same walk the panel runs, from the same builder: the index and the
     -- count sidecar it leaves behind are readable by either entry. Its stdout
     -- (count and elapsed milliseconds) is only of use to the panel's footer,
@@ -93,7 +93,7 @@ local function buildIndex(query)
         local queued = pendingQuery
         pendingQuery = nil
         if result.exitCode == 0 and not result.timedOut then
-            if builtScope ~= shared.scope then
+            if builtScope ~= shared.cacheTag() then
                 -- The scope row was activated while the walk ran: this index
                 -- is not the one the launcher is showing. Start the query over
                 -- so roots, records and freshness are derived for the scope
@@ -169,8 +169,8 @@ runQuery = function(query)
             table.insert(rows, noopRow("launcher.no_results"))
         end
         if text == "" then
-            table.insert(rows, scopeRow())
-            table.insert(rows, reindexRow())
+            table.insert(rows, 1, scopeRow())
+            table.insert(rows, 2, reindexRow())
         elseif staleIndex then
             -- Results came from an index that no longer matches the disks;
             -- the way to fix that travels with them.
@@ -232,13 +232,14 @@ function onQuery(query)
     -- Re-read on every query: the panel may have cycled the scope or the
     -- ranking since the last keystroke, and both files are a single word.
     shared.scope = shared.readScope(dir)
+    shared.whole = shared.readWhole(dir)
     shared.ranking = shared.readRanking(dir)
     withMounts(query, function(current)
         shared.roots = shared.computeRoots()
         -- How to read what is on disk right now; a walk below overwrites both.
         shared.indexRoots = shared.indexRootsOf(dir) or shared.roots
         shared.absoluteRecords = #shared.indexRoots > 1
-        if shared.cacheFresh(dir) then
+        if shared.cacheFresh(dir) and not forceBuild then
             staleIndex = false
             runQuery(current)
             return
@@ -255,7 +256,7 @@ function onQuery(query)
             return
         end
         staleIndex = true
-        if noctalia.fileExists(dir .. "/list-" .. shared.scope) then
+        if noctalia.fileExists(dir .. "/list-" .. shared.cacheTag()) then
             runQuery(current)
         else
             launcher.setResults(current, { noopRow("launcher.index_missing"), reindexRow(), scopeRow() })
@@ -287,6 +288,9 @@ function onActivate(id)
         forceBuild = true
         shared.mountsAt = 0 -- rescan: a disk may have been plugged in since
         launcher.setQuery("")
+        -- The query is already "" here, so the host may not re-enter onQuery on
+        -- its own; run it directly so the walk starts now, not on the next open.
+        onQuery("")
         return
     end
     local rel = id:match("^open:(.+)$")

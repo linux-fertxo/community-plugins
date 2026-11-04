@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import re
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -56,6 +57,7 @@ ALLOWED_TAGS = {
     "system",
     "theming",
     "time",
+    "umbriel",
     "utility",
     "video",
     "void",
@@ -97,6 +99,11 @@ WEBP_MAGIC_FORMAT = b"WEBP"
 # Enough of the file to cover the RIFF header plus the first chunk header and the widest
 # dimension field of any WebP variant.
 WEBP_HEADER_BYTES = 32
+# Every clone, CI run, and install checks out every file a plugin ships, so one submission's file
+# count is a repo-wide cost. The largest plugin on main ships 59 files; a generated per-frame
+# animation pack shipped 2530. 200 leaves real asset sets over 3x headroom while rejecting dumps
+# that belong in one archive or in the user's cache directory.
+MAX_PLUGIN_FILES = 200
 
 ROOT_STRING_FIELDS = (
     "id",
@@ -125,6 +132,7 @@ SETTING_TYPES = {
 }
 PANEL_PLACEMENTS = {"attached", "floating"}
 PANEL_KEYBOARD_FOCUS = {"on_demand", "exclusive", "none"}
+PANEL_LAYERS = {"follow", "top", "overlay"}
 WIDGET_GESTURES = {
     "left",
     "right",
@@ -156,14 +164,16 @@ ROOT_FIELDS = set(ROOT_STRING_FIELDS) | set(ROOT_ARRAY_FIELDS) | set(ENTRY_TYPES
 }
 BASE_ENTRY_FIELDS = {"id", "entry"}
 ENTRY_FIELDS = {
-    "widget": BASE_ENTRY_FIELDS | {"setting", "actions"},
+    "widget": BASE_ENTRY_FIELDS | {"setting", "actions", "hover_highlight"},
     "panel": BASE_ENTRY_FIELDS
     | {
         "setting",
         "width",
         "height",
+        "max_height",
         "placement",
         "position",
+        "layer",
         "open_near_click",
         "dismiss_on_outside_click",
         "keyboard_focus",
@@ -190,9 +200,11 @@ SETTING_FIELDS = {
     "step",
     "visible_when",
     "advanced",
+    "secret",
 }
 OPTION_FIELDS = {"value", "label_key"}
 VISIBLE_WHEN_FIELDS = {"key", "values"}
+SECRET_SETTING_TYPES = {"string", "string_list", "string_map"}
 
 # Raw HTML is not supported on plugin pages. Markdown autolinks such as
 # <https://example.com> do not match this expression.
@@ -210,6 +222,29 @@ ATX_HEADING_RE = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
 OBSOLETE_CONFIG_ACCESSOR_RE = re.compile(
     r"\b(barWidget|desktopWidget|panel|launcher)\s*\.\s*getConfig\b"
 )
+# Plugin color roles, mirroring ColorRole in noctalia-shell src/ui/palette.h. API 43 added
+# the container roles and retired surface_variant / outline (aliased with a warning until 5.5.0).
+COLOR_ROLES_API = 43
+COLOR_ROLES_ADDED = {
+    "primary_container",
+    "on_primary_container",
+    "secondary_container",
+    "on_secondary_container",
+    "tertiary_container",
+    "on_tertiary_container",
+    "error_container",
+    "on_error_container",
+    "surface_container_low",
+    "surface_container",
+    "surface_container_high",
+    "surface_container_highest",
+    "outline_variant",
+    "scrim",
+}
+RETIRED_COLOR_ROLES = {"surface_variant": "surface_container", "outline": "outline_variant"}
+# "outline" is also a ui.button variant, so it only counts as a color role when the
+# literal sits in the value of a UiColor prop.
+COLOR_PROP_VALUE_RE = re.compile(r"\b(?:fill|border|color2?|track)\s*=(?!=)[^,;=(){}\[\]]*$")
 
 
 def is_non_empty_string(value: Any) -> bool:
@@ -311,9 +346,14 @@ def section_body(markdown: str, headings: list[tuple[int, str, int, int]], index
     return markdown[body_start:body_end].strip()
 
 
-def obsolete_config_accessors(source: str) -> list[tuple[str, int]]:
-    """Find removed entry-specific getConfig aliases outside Luau comments and strings."""
+def scan_luau(source: str) -> tuple[str, list[tuple[int, str]]]:
+    """Mask Luau comments and strings; return the masked code and each quoted literal.
+
+    Literals are (offset, contents) for '...' and "..." strings; long [[...]] strings are
+    masked but not returned.
+    """
     visible = list(source)
+    literals: list[tuple[int, str]] = []
     length = len(source)
     index = 0
 
@@ -347,24 +387,50 @@ def obsolete_config_accessors(source: str) -> list[tuple[str, int]]:
         if source[index] in "\"'":
             quote = source[index]
             end = index + 1
+            closed = False
             while end < length:
                 if source[end] == "\\" and end + 1 < length:
                     end += 2
                     continue
                 end += 1
                 if source[end - 1] == quote:
+                    closed = True
                     break
+            literals.append((index, source[index + 1 : end - 1 if closed else end]))
             mask(index, end)
             index = end
             continue
 
         index += 1
 
-    code = "".join(visible)
+    return "".join(visible), literals
+
+
+def obsolete_config_accessors(source: str) -> list[tuple[str, int]]:
+    """Find removed entry-specific getConfig aliases outside Luau comments and strings."""
+    code, _ = scan_luau(source)
     return [
         (f"{match.group(1)}.getConfig", code.count("\n", 0, match.start()) + 1)
         for match in OBSOLETE_CONFIG_ACCESSOR_RE.finditer(code)
     ]
+
+
+def color_role_problems(source: str, plugin_api: Any) -> list[str]:
+    """Retired color roles, and API 43 roles used by a plugin declaring an older API."""
+    code, literals = scan_luau(source)
+    problems = []
+    for offset, contents in literals:
+        role = contents.split("/", 1)[0]
+        line = source.count("\n", 0, offset) + 1
+        if role in RETIRED_COLOR_ROLES:
+            if role == "outline" and not COLOR_PROP_VALUE_RE.search(code, code.rfind("\n", 0, offset) + 1, offset):
+                continue
+            problems.append(
+                f"color role '{role}' on line {line} was retired; use '{RETIRED_COLOR_ROLES[role]}'"
+            )
+        elif role in COLOR_ROLES_ADDED and is_int(plugin_api) and plugin_api < COLOR_ROLES_API:
+            problems.append(f"color role '{role}' on line {line} requires plugin_api >= {COLOR_ROLES_API}")
+    return problems
 
 
 def webp_dimensions(header: bytes) -> tuple[int, int] | None:
@@ -731,15 +797,19 @@ class Validator:
         entry: dict[str, Any],
         plugin_api: Any,
     ) -> None:
-        # Mirrors the shell parser: a positive number (logical px) or the
-        # literal string "fill" (span the output's available extent; requires
-        # floating placement).
+        # Mirrors the shell parser: positive logical px, "fill" (floating
+        # placement), or height = "content" with a required cap from API 42.
         uses_fill = False
+        uses_content_height = entry.get("height") == "content"
         for field in ("width", "height"):
             if field not in entry:
                 continue
 
             value = entry[field]
+            if field == "height" and uses_content_height:
+                if not is_int(plugin_api) or plugin_api < 42:
+                    self.add_context_error(manifest_path, context, 'height "content" requires plugin_api >= 42')
+                continue
             if isinstance(value, str):
                 if value != "fill":
                     self.add_context_error(manifest_path, context, f'{field} must be a positive number or "fill"')
@@ -750,6 +820,18 @@ class Validator:
 
         if uses_fill and entry.get("placement", "floating") != "floating":
             self.add_context_error(manifest_path, context, 'width/height "fill" requires placement = "floating"')
+
+        if "max_height" in entry:
+            if not uses_content_height:
+                self.add_context_error(manifest_path, context, 'max_height requires height = "content"')
+            value = entry["max_height"]
+            if not is_number(value) or not math.isfinite(value) or value <= 0:
+                self.add_context_error(manifest_path, context, "max_height must be a positive number")
+        elif uses_content_height:
+            self.add_context_error(manifest_path, context, 'height "content" requires max_height')
+
+        if uses_content_height and entry.get("persistent") is True:
+            self.add_context_error(manifest_path, context, 'height "content" is not supported with persistent = true')
 
         if "placement" in entry:
             placement = entry["placement"]
@@ -769,6 +851,15 @@ class Validator:
 
         if "open_near_click" in entry and not isinstance(entry["open_near_click"], bool):
             self.add_context_error(manifest_path, context, "open_near_click must be a bool")
+
+        if "layer" in entry:
+            if not is_int(plugin_api) or plugin_api < 30:
+                self.add_context_error(manifest_path, context, "layer requires plugin_api >= 30")
+            elif not isinstance(entry["layer"], str) or entry["layer"] not in PANEL_LAYERS:
+                valid = ", ".join(sorted(PANEL_LAYERS))
+                self.add_context_error(manifest_path, context, f"layer must be one of: {valid}")
+            elif entry["layer"] == "follow" and plugin_api < 49:
+                self.add_context_error(manifest_path, context, 'layer "follow" requires plugin_api >= 49')
 
         if "dismiss_on_outside_click" in entry:
             if not is_int(plugin_api) or plugin_api < 8:
@@ -810,6 +901,12 @@ class Validator:
         entry: dict[str, Any],
         plugin_api: Any,
     ) -> None:
+        if "hover_highlight" in entry:
+            if not is_int(plugin_api) or plugin_api < 34:
+                self.add_context_error(manifest_path, context, "hover_highlight requires plugin_api >= 34")
+            elif not isinstance(entry["hover_highlight"], bool):
+                self.add_context_error(manifest_path, context, "hover_highlight must be a bool")
+
         if "actions" not in entry:
             return
 
@@ -1159,6 +1256,17 @@ class Validator:
             if "advanced" in setting and not isinstance(setting["advanced"], bool):
                 self.add_context_error(manifest_path, context, "advanced must be a bool")
 
+            # Mirrors the shell parser: API 47, string-valued types only.
+            if "secret" in setting:
+                if not is_int(plugin_api) or plugin_api < 47:
+                    self.add_context_error(manifest_path, context, "secret requires plugin_api >= 47")
+                elif not isinstance(setting["secret"], bool):
+                    self.add_context_error(manifest_path, context, "secret must be a bool")
+                elif setting["secret"] and setting_type not in SECRET_SETTING_TYPES:
+                    self.add_context_error(
+                        manifest_path, context, "secret is only valid for string, string_list, and string_map settings"
+                    )
+
     def validate_translation_keys(self, plugin_dir: Path, translations: Any | None) -> None:
         # The store rejects the whole plugin if any translation key is not lowercase, so catch
         # bad keys (e.g. "zh-Hans") here even when no label_key references them.
@@ -1331,7 +1439,7 @@ class Validator:
             elif not section_body(contents, headings, settings_index):
                 self.add_error(readme, "'## Settings' section must not be empty")
 
-    def validate_luau_api(self, plugin_dir: Path) -> None:
+    def validate_luau_api(self, plugin_dir: Path, plugin_api: Any) -> None:
         for source_path in sorted(plugin_dir.rglob("*.luau")):
             try:
                 source = source_path.read_text(encoding="utf-8")
@@ -1344,11 +1452,85 @@ class Validator:
                     source_path,
                     f"'{accessor}' on line {line} was removed; use noctalia.getConfig",
                 )
+            for problem in color_role_problems(source, plugin_api):
+                self.add_error(source_path, problem)
 
     def validate_no_symlinks(self, manifest_path: Path, plugin_dir: Path) -> None:
         for path in plugin_dir.rglob("*"):
             if path.is_symlink():
                 self.add_error(manifest_path, f"'{rel(self.root, path)}' is a symlink; plugins ship real files")
+
+    def validate_file_count(self, manifest_path: Path, plugin_dir: Path) -> None:
+        count = sum(1 for path in plugin_dir.rglob("*") if path.is_file())
+        if count > MAX_PLUGIN_FILES:
+            self.add_error(
+                manifest_path,
+                f"plugin directory ships {count} files; the limit is {MAX_PLUGIN_FILES} "
+                "(every clone, CI run, and install checks out every file - ship generated asset "
+                "packs as one archive or generate them into the user's cache directory on first run)",
+            )
+
+    def git_index_entries(self) -> list[tuple[str, str]] | None:
+        # Returns (mode, path) for every tracked entry, or None when this is not the repository
+        # checkout (unit tests validate detached temporary directories) or git is unavailable.
+        try:
+            probe = subprocess.run(
+                ["git", "-C", str(self.root), "rev-parse", "--show-toplevel"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            return None
+        if probe.returncode != 0:
+            return None
+        try:
+            toplevel = Path(probe.stdout.strip()).resolve()
+        except OSError:
+            return None
+        if toplevel != self.root:
+            return None
+
+        try:
+            listed = subprocess.run(
+                ["git", "-C", str(self.root), "-c", "core.quotePath=false", "ls-files", "--stage"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            return None
+        if listed.returncode != 0:
+            return None
+
+        entries: list[tuple[str, str]] = []
+        for line in listed.stdout.splitlines():
+            metadata, separator, path = line.partition("\t")
+            if not separator:
+                continue
+            entries.append((metadata.split(" ", 1)[0], path))
+        return entries
+
+    def validate_git_objects(self) -> None:
+        # Plugins ship as plain files committed in this repository. A gitlink (mode 160000) or a
+        # committed .gitmodules points at content stored elsewhere: a fresh clone checks out an
+        # empty plugin directory, the shell cannot install it, and reviewers cannot inspect it.
+        entries = self.git_index_entries()
+        if entries is None:
+            return
+
+        for mode, path in entries:
+            if mode == "160000":
+                self.add_error(
+                    self.root / path,
+                    "is a git submodule (mode 160000); plugins ship plain files committed in this "
+                    "repository, so commit the plugin's files instead of a submodule",
+                )
+            elif Path(path).name == ".gitmodules":
+                self.add_error(
+                    self.root / path,
+                    "declares git submodules; plugins ship plain files committed in this repository",
+                )
 
     def validate_manifest(self, manifest_path: Path) -> None:
         manifest = self.load_manifest(manifest_path)
@@ -1363,8 +1545,9 @@ class Validator:
         self.validate_required_files(manifest_path, plugin_dir)
         self.validate_thumbnail(manifest_path, plugin_dir)
         self.validate_readme(plugin_dir, manifest)
-        self.validate_luau_api(plugin_dir)
+        self.validate_luau_api(plugin_dir, manifest.get("plugin_api"))
         self.validate_no_symlinks(manifest_path, plugin_dir)
+        self.validate_file_count(manifest_path, plugin_dir)
 
         if "setting" in manifest:
             self.validate_settings(
@@ -1389,6 +1572,7 @@ class Validator:
 
     def validate(self) -> int:
         self.validate_layout()
+        self.validate_git_objects()
         manifests = sorted(self.root.glob("*/plugin.toml"))
         for manifest_path in manifests:
             self.validate_manifest(manifest_path)
